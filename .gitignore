@@ -1,0 +1,47 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Generated measurement data (workbooks, scope PNG/CSV captures, backups)
+# Keep these on the measurement PC or a dedicated data archive, not in Git.
+results/
+captures/
+logs/
+*.log
+~$*.xlsx
+*.xlsx.bak
+*.xlsx.tmp
+
+# Machine-specific bench state and instrument addresses
+bench_config.json
+bench_config.local.json
+!bench_config.example.json
+
+# Vendor reference documents are local-only; runtime instrument images remain tracked.
+instruments/*.xlsx
+instruments/*.xls
+instruments/*.pdf
+
+# Secrets and editor/OS files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Packaging/build output
+build/
+dist/
+*.egg-info/
+

@@ -1,0 +1,47 @@
+{
+  "schema": 5,
+  "campaign_name": "SID efficiency test",
+  "working_current_cap_a": 20.0,
+  "last_modulation_label": "",
+  "recent_modulations": [],
+  "workbook": "results/SID_APEC_extension.xlsx",
+  "fpga_root": "",
+  "visa_library": "C:\\Windows\\System32\\visa64.dll",
+  "addresses": {
+    "pa": "",
+    "load": "",
+    "psu": "",
+    "scope": ""
+  },
+  "supply_channels": [
+    {
+      "channel": 1,
+      "role": "",
+      "displayed": true,
+      "enabled": false,
+      "contributes_loss": false,
+      "voltage_set": 0.0,
+      "current_limit": 1.0
+    },
+    {
+      "channel": 2,
+      "role": "",
+      "displayed": true,
+      "enabled": false,
+      "contributes_loss": false,
+      "voltage_set": 0.0,
+      "current_limit": 1.0
+    },
+    {
+      "channel": 3,
+      "role": "gate driver",
+      "displayed": true,
+      "enabled": false,
+      "contributes_loss": true,
+      "voltage_set": 6.0,
+      "current_limit": 1.0
+    }
+  ],
+  "vin_target_v": 48.0,
+  "frequency_hz": 100000.0
+}
