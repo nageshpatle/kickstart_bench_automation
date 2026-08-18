@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import threading
 import time
@@ -12,7 +13,9 @@ from sid_instruments import InstrumentHub, InstrumentSnapshot, SupplyChannel, Vi
 
 
 @pytest.fixture(autouse=True)
-def clean_qt_state():
+def clean_qt_state(tmp_path, monkeypatch):
+    # No GUI test may ever touch the operator's configured campaign workbook.
+    monkeypatch.setenv("KICKSTART_WORKBOOK_PATH", str(tmp_path / "pytest_campaign.xlsx"))
     yield
     try:
         from PyQt6 import QtCore, QtWidgets
@@ -33,6 +36,76 @@ def run_record(run_id: str, source: str = "Simulation") -> dict:
     record = {name: "" for name in RUN_HEADERS}
     record.update({"RunID": run_id, "Created": "2026-08-16T00:00:00Z", "Status": "Valid", "DataSource": source, "Mode": "Continuous", "VinTarget_V": 48.0, "ModulationLabel": "test-custom-profile", "Frequency_Hz": 100000.0})
     return record
+
+
+def test_simulation_and_hardware_use_separate_workbooks_and_combined_history():
+    import os
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets
+    from sid_bench_gui import MainWindow
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
+    window = MainWindow()
+    assert window.hardware_store.path != window.simulation_store.path
+    window.hardware_store.create_run({**run_record("HW-RUN", "Hardware"), "CampaignName": "Measured"})
+    window.simulation_store.create_run({**run_record("SIM-RUN", "Simulation"), "CampaignName": "Demo"})
+    window._load_history()
+    sources = {window.history_table.item(row, 4).text() for row in range(window.history_table.rowCount())}
+    assert sources == {"Hardware", "Simulation"}
+    window.close()
+
+
+def test_busy_live_workbook_uses_one_pending_state_without_fallback_files(tmp_path: Path, monkeypatch):
+    target = tmp_path / "campaign.xlsx"
+    store = WorkbookStore(target)
+    store.create_run(run_record("BASE", "Hardware"))
+    real_replace = os.replace
+
+    def reject_live_replace(source, destination):
+        if Path(destination) == target:
+            raise PermissionError("simulated Excel lock")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", reject_live_replace)
+    assert store.create_run(run_record("QUEUED", "Hardware")) is True
+    assert store.pending_path.exists()
+    assert {run["RunID"] for run in store.list_runs()} == {"BASE", "QUEUED"}
+    assert list(tmp_path.glob("fallback_*.xlsx")) == []
+
+
+def test_duplicate_points_are_scoped_to_run_mode(tmp_path: Path):
+    store = WorkbookStore(tmp_path / "mode_identity.xlsx")
+    store.create_run(run_record("STEP-RUN"))
+    record = {name: "" for name in MEAS_HEADERS}
+    record.update({
+        "PointID": "STEP-P001", "RunID": "STEP-RUN", "Status": "Valid",
+        "DataSource": "Simulation", "Mode": "Step Current", "VinTarget_V": 48.0,
+        "ModulationLabel": "same-name", "Frequency_Hz": 100000.0, "RequestedIout_A": 2.0,
+    })
+    store.append_measurement(record)
+    base = {"DataSource": "Simulation", "VinTarget_V": 48.0, "ModulationLabel": "same-name", "Frequency_Hz": 100000.0}
+    assert store.find_duplicates({**base, "Mode": "Step Current"}, [2.0])
+    assert store.find_duplicates({**base, "Mode": "Pulse"}, [2.0]) == []
+
+
+def test_full_run_names_include_mode_and_minimal_parameters():
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets
+    from sid_bench_gui import MainWindow
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
+    window = MainWindow()
+    window.test_name.setText("test1")
+    window.btn_mode_cont.click()
+    window.cont_stop.setValue(min(20.0, window.cap_val))
+    continuous = window._collect_settings()
+    assert continuous["run_record"]["CampaignName"].startswith("test1_Continuous_")
+    window.btn_mode_pulse.click()
+    window.pulse_stop.setValue(min(20.0, window.cap_val))
+    pulse = window._collect_settings()
+    assert "test1_Pulse_" in pulse["run_record"]["CampaignName"]
+    assert pulse["mode"] == "Pulse"
+    window.close()
 
 
 
@@ -546,11 +619,12 @@ def test_smart_enabled_states_during_run():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
     window = MainWindow()
     
-    # In hardware mode before verifying load, run sweep is disabled
+    # In hardware mode before verifying load, run sweep is enabled and clickable with informative tooltip
     window.simulation.setChecked(False)
     window.chk_load.setChecked(False)
     window.update_enabled_states()
-    assert not window.run_sweep_btn.isEnabled()
+    assert window.run_sweep_btn.isEnabled()
+    assert "Hardware write locked" in window.run_sweep_btn.toolTip()
     
     # Once verified, run sweep is enabled
     window.chk_load.setChecked(True)
@@ -562,6 +636,124 @@ def test_smart_enabled_states_during_run():
     window.chk_load.setChecked(False)
     window.update_enabled_states()
     assert window.run_sweep_btn.isEnabled()
+    window.close()
+
+
+def test_low_current_verification_gating_across_all_run_modes(monkeypatch):
+    import os
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets
+    from sid_bench_gui import MainWindow
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
+
+    window = MainWindow()
+    window.show()
+
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda parent, title, text, *args: warnings.append((title, text)))
+
+    load_commands: list[tuple[str, Any]] = []
+    real_set_current = window.hub.instruments["load"].set_current
+    real_set_input = window.hub.instruments["load"].set_input
+    monkeypatch.setattr(window.hub.instruments["load"], "set_current", lambda v: (load_commands.append(("set_current", v)), real_set_current(v)))
+    monkeypatch.setattr(window.hub.instruments["load"], "set_input", lambda s: (load_commands.append(("set_input", s)), real_set_input(s)))
+
+    # 1. Hardware Mode + Verification UNCHECKED
+    window.simulation.setChecked(False)
+    window.chk_load.setChecked(False)
+    window.update_enabled_states()
+
+    # A. SET CURRENT (Mode 0)
+    window.btn_mode_direct.click()
+    QtWidgets.QApplication.processEvents()
+    window.manual_target_spin.setValue(10.0)
+    warnings.clear()
+    load_commands.clear()
+    window.btn_direct_set.click()
+    QtWidgets.QApplication.processEvents()
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "Hardware write locked"
+    assert "Check 'I verified low-current load control on this bench' in Bench Setup first." in warnings[0][1]
+    assert len([c for c in load_commands if c[0] == "set_input" and c[1] is True]) == 0
+    assert window._manual_target_current == 0.0
+
+    # B. STEP CURRENT + (Mode 1)
+    window.btn_mode_step.click()
+    QtWidgets.QApplication.processEvents()
+    window.manual_step_inc.setValue(2.0)
+    warnings.clear()
+    load_commands.clear()
+    window.btn_plus_step.click()
+    QtWidgets.QApplication.processEvents()
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "Hardware write locked"
+    assert "Check 'I verified low-current load control on this bench' in Bench Setup first." in warnings[0][1]
+    assert len([c for c in load_commands if c[0] == "set_input" and c[1] is True]) == 0
+    assert window._manual_target_current == 0.0
+
+    # C. CONTINUOUS SWEEP START (Mode 2)
+    window.btn_mode_cont.click()
+    QtWidgets.QApplication.processEvents()
+    assert window.run_sweep_btn.isEnabled() is True
+    warnings.clear()
+    load_commands.clear()
+    window.run_sweep_btn.click()
+    QtWidgets.QApplication.processEvents()
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "Hardware write locked"
+    assert "Check 'I verified low-current load control on this bench' in Bench Setup first." in warnings[0][1]
+    assert window.worker is None or not window.worker.isRunning()
+    assert window.run_sweep_btn.isEnabled() is True
+    assert "START SWEEP" in window.run_sweep_btn.text()
+    assert len([c for c in load_commands if c[0] == "set_input" and c[1] is True]) == 0
+
+    # D. PULSE SWEEP START (Mode 3)
+    window.btn_mode_pulse.click()
+    QtWidgets.QApplication.processEvents()
+    assert window.run_sweep_btn.isEnabled() is True
+    warnings.clear()
+    load_commands.clear()
+    window.run_sweep_btn.click()
+    QtWidgets.QApplication.processEvents()
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "Hardware write locked"
+    assert "Check 'I verified low-current load control on this bench' in Bench Setup first." in warnings[0][1]
+    assert window.worker is None or not window.worker.isRunning()
+    assert window.run_sweep_btn.isEnabled() is True
+    assert "START PULSE" in window.run_sweep_btn.text()
+    assert len([c for c in load_commands if c[0] == "set_input" and c[1] is True]) == 0
+
+    # 2. Safety Actions ALWAYS Permitted without warning when unchecked
+    warnings.clear()
+    window.btn_direct_zero.click()
+    QtWidgets.QApplication.processEvents()
+    assert len(warnings) == 0
+
+    warnings.clear()
+    window.btn_step_zero.click()
+    QtWidgets.QApplication.processEvents()
+    assert len(warnings) == 0
+
+    warnings.clear()
+    window.emergency_stop_action()
+    QtWidgets.QApplication.processEvents()
+    assert len(warnings) == 0
+
+    # 3. With Verification CHECKED: All operate without warning
+    window.chk_load.setChecked(True)
+    window.update_enabled_states()
+    assert window.require_load_control_verified() is True
+
+    # 4. Demo Mode ON: Operates without requiring verification checkbox
+    window.simulation.setChecked(True)
+    window.chk_load.setChecked(False)
+    window.update_enabled_states()
+    assert window.require_load_control_verified() is True
+
     window.close()
 
 
@@ -1352,8 +1544,8 @@ def test_simplified_test_setup_strip_and_blank_auto_name():
     window.test_name.setText("")
     settings = window._collect_settings()
     assert settings["run_record"]["CampaignName"].startswith("Test_")
-    assert len(settings["run_record"]["CampaignName"]) >= 15  # e.g. Test_20260817_0424
-    assert window.test_name.text() == settings["run_record"]["CampaignName"]
+    assert window.test_name.text().startswith("Test_")
+    assert window.test_name.text() in settings["run_record"]["CampaignName"]
 
     window.close()
 
@@ -1393,10 +1585,10 @@ def test_chroma_safety_limit_card_and_bench_configuration():
     assert window.cont_stop.maximum() == 45.0
     assert window.pulse_stop.maximum() == 45.0
 
-    # Restore 70 A limit
-    window.load_card.cap_spin.setValue(70.0)
+    # Restore default 60 A limit
+    window.load_card.cap_spin.setValue(60.0)
     window.load_card.apply_cap_btn.click()
-    assert window.cap_val == 70.0
+    assert window.cap_val == 60.0
 
     window.close()
 
@@ -1420,7 +1612,7 @@ def test_graceful_stop_and_return_to_zero_sweep_worker(tmp_path: Path):
         def safe_off(self):
             self.safe_off_called = True
             self.input_states.append(False)
-        def read_snapshot(self):
+        def read_snapshot(self, **_: Any):
             return InstrumentSnapshot("load", {"current": self.currents_commanded[-1] if self.currents_commanded else 0.0, "enabled": True})
 
     class FakePA:
@@ -1523,7 +1715,7 @@ def test_continuous_normal_completion_auto_ramp(tmp_path: Path):
         def set_current(self, amps: float): self.currents_commanded.append(amps)
         def set_input(self, state: bool): self.input_states.append(state)
         def safe_off(self): self.input_states.append(False)
-        def read_snapshot(self):
+        def read_snapshot(self, **_: Any):
             return InstrumentSnapshot("load", {"current": self.currents_commanded[-1] if self.currents_commanded else 0.0, "enabled": True})
 
     class FakePA:
@@ -1608,7 +1800,7 @@ def test_emergency_abort_immediate_safe_off(tmp_path: Path):
         def safe_off(self):
             self.safe_off_called = True
             self.input_states.append(False)
-        def read_snapshot(self):
+        def read_snapshot(self, **_: Any):
             return InstrumentSnapshot("load", {"current": self.currents_commanded[-1] if self.currents_commanded else 0.0, "enabled": True})
 
     hub = InstrumentHub(True, {})
@@ -1766,17 +1958,18 @@ def test_four_peer_modes_and_true_disclosure_collapse():
     window.close()
 
 
-def test_step_current_delayed_auto_recording():
+def test_step_current_delayed_auto_recording(tmp_path):
     import os, time
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     from PyQt6 import QtWidgets, QtCore
-    from sid_bench_gui import MainWindow
+    from sid_bench_gui import MainWindow, WorkbookStore
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
     window = MainWindow()
+    window.store = WorkbookStore(tmp_path / "step_test.xlsx")
     window.show()
     window.simulation.setChecked(True)
 
-    def wait_for_ui(condition, timeout=5.0):
+    def wait_for_ui(condition, timeout=10.0):
         start = time.time()
         while not condition() and (time.time() - start) < timeout:
             QtWidgets.QApplication.processEvents()
@@ -1845,7 +2038,7 @@ def test_step_current_delayed_auto_recording():
     # Click Save Reading early before timer expires
     window.step_save_btn.click()
     assert not window._step_countdown_timer.isActive()
-    wait_for_ui(lambda: window._step_save_done and window._step_capture_done)
+    wait_for_ui(lambda: "4.00 A" in window.step_status_lbl.text() and not window._step_is_busy())
     assert window._step_save_done is True
     assert window._step_capture_done is True
     assert "✓ RECORDED · 4.00 A" in window.step_status_lbl.text()
@@ -1879,6 +2072,11 @@ def test_step_current_delayed_auto_recording():
     assert "0.00 A · OFF" in window.step_present_lbl.text()
     assert window.btn_plus_step.isEnabled() is True
     assert window.btn_minus_step.isEnabled() is True
+    closed_runs = window.store.list_runs()
+    closed_step = next(run for run in closed_runs if run["RunID"] == runs[-1]["RunID"])
+    assert closed_step["Status"] == "Valid"
+    assert "_StepCurrent_2to4A" in closed_step["CampaignName"]
+    assert len(window.store.get_run_measurements(closed_step["RunID"])) >= 2
 
     # 6. Distinct Points: Step to 2 A again after zeroing produces a distinct run/point ID
     window.btn_plus_step.click()
@@ -1887,6 +2085,144 @@ def test_step_current_delayed_auto_recording():
     first_2a_run_id = runs[-1]["RunID"]
     new_2a_run_id = window._step_run_id
     assert first_2a_run_id != new_2a_run_id
+
+    window.close()
+
+
+def test_step_current_ascending_only_recording_and_descending_unload(tmp_path):
+    import os, time
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets, QtCore
+    from sid_bench_gui import MainWindow, WorkbookStore
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
+    window = MainWindow()
+    window.store = WorkbookStore(tmp_path / "step_ascend_test.xlsx")
+    window.show()
+    window.simulation.setChecked(True)
+
+    def wait_for_ui(condition, timeout=10.0):
+        start = time.time()
+        while not condition() and (time.time() - start) < timeout:
+            QtWidgets.QApplication.processEvents()
+            QtCore.QThread.msleep(20)
+        QtWidgets.QApplication.processEvents()
+
+    # 1. Switch to STEP CURRENT mode
+    window.btn_mode_step.click()
+    QtWidgets.QApplication.processEvents()
+    assert window.run_stack.currentIndex() == 1
+
+    window.manual_step_inc.setValue(2.0)
+    window.manual_step_dec.setValue(5.0)
+    window.step_auto_save.setChecked(True)
+    window.step_auto_capture.setChecked(True)
+
+    # 2. Perform 5 ascending steps (+2 A each): 0 → 2 → 4 → 6 → 8 → 10 A
+    for expected_amps in (2.0, 4.0, 6.0, 8.0, 10.0):
+        window.btn_plus_step.click()
+        wait_for_ui(lambda: window._step_countdown_timer.isActive())
+        assert window._manual_target_current == expected_amps
+        # Expire countdown to trigger measurement + capture
+        window._step_remaining_ms = 0
+        window._step_countdown_tick()
+        wait_for_ui(lambda: f"{expected_amps:.2f} A" in window.step_status_lbl.text() and not window._step_is_busy())
+        assert f"✓ RECORDED · {expected_amps:.2f} A" in window.step_status_lbl.text()
+        assert window.btn_plus_step.isEnabled() is True
+        assert window.btn_minus_step.isEnabled() is True
+
+    run_id = window._step_run_id
+    upward_measurements = window.store.get_run_measurements(run_id)
+    assert len(upward_measurements) == 5
+    upward_currents = [m["RequestedIout_A"] for m in upward_measurements]
+    assert upward_currents == [2.0, 4.0, 6.0, 8.0, 10.0]
+    scope_captures = [m for m in upward_measurements if m.get("ScopeCaptureStatus") == "Captured"]
+    assert len(scope_captures) == 5
+
+    # 3. Descending unload step 1: 10 A → 5 A (-5 A)
+    window.btn_minus_step.click()
+    wait_for_ui(lambda: not window._step_is_busy())
+    assert window._manual_target_current == 5.0
+    assert window.hub.environment.current_set == 5.0
+    assert window.hub.environment.load_enabled is True
+    assert "5.00 A · ON" in window.step_present_lbl.text()
+    assert window._step_countdown_timer.isActive() is False
+    assert "RECORDED" not in window.step_status_lbl.text()
+    assert "READY" in window.step_status_lbl.text() or "5.00 A" in window.step_status_lbl.text()
+
+    # Verify no new measurement row was added for 5 A
+    meas_after_first_down = window.store.get_run_measurements(run_id)
+    assert len(meas_after_first_down) == 5
+    assert 5.0 not in [m["RequestedIout_A"] for m in meas_after_first_down]
+
+    # 4. Descending unload step 2: 5 A → 0 A (-5 A)
+    window.btn_minus_step.click()
+    wait_for_ui(lambda: not window._step_is_busy())
+    assert window._manual_target_current == 0.0
+    assert window.hub.environment.current_set == 0.0
+    assert window.hub.environment.load_enabled is False
+    assert "0.00 A · OFF" in window.step_present_lbl.text()
+    assert window._step_countdown_timer.isActive() is False
+    assert "RECORDED" not in window.step_status_lbl.text()
+    assert "READY" in window.step_status_lbl.text()
+
+    # Verify no new measurement row was added for 0 A
+    meas_after_second_down = window.store.get_run_measurements(run_id)
+    assert len(meas_after_second_down) == 5
+    assert [m["RequestedIout_A"] for m in meas_after_second_down] == [2.0, 4.0, 6.0, 8.0, 10.0]
+
+    # 5. Direct return to ZERO / OFF
+    window.btn_step_zero.click()
+    wait_for_ui(lambda: not window._step_is_busy())
+    assert window.hub.environment.load_enabled is False
+    assert window.hub.environment.current_set == 0.0
+    assert "0.00 A · OFF" in window.step_present_lbl.text()
+    assert "READY" in window.step_status_lbl.text()
+
+    final_meas = window.store.get_run_measurements(run_id)
+    assert len(final_meas) == 5
+    assert [m["RequestedIout_A"] for m in final_meas] == [2.0, 4.0, 6.0, 8.0, 10.0]
+
+    # 6. Test ZERO / OFF cancellation during active settling
+    window.btn_plus_step.click()
+    wait_for_ui(lambda: window._step_countdown_timer.isActive())
+    assert window._step_countdown_timer.isActive() is True
+    zero_cancel_run_id = window._step_run_id
+
+    window.btn_step_zero.click()
+    QtWidgets.QApplication.processEvents()
+    assert window._step_countdown_timer.isActive() is False
+    assert window.hub.environment.load_enabled is False
+    assert window.hub.environment.current_set == 0.0
+    assert "0.00 A · OFF" in window.step_present_lbl.text()
+    assert "READY" in window.step_status_lbl.text()
+
+    zero_meas = window.store.get_run_measurements(zero_cancel_run_id)
+    assert len(zero_meas) == 0
+
+    # 7. Test -5 A Step Down cancellation during active settling
+    window.btn_plus_step.click()
+    wait_for_ui(lambda: window._step_countdown_timer.isActive())
+    window._step_remaining_ms = 0
+    window._step_countdown_tick()
+    wait_for_ui(lambda: "✓ RECORDED · 2.00 A" in window.step_status_lbl.text() and not window._step_is_busy())
+
+    step_cancel_run_id = window._step_run_id
+    assert len(window.store.get_run_measurements(step_cancel_run_id)) == 1
+
+    # Step up to 4 A, then immediately step down (-5 A) while settling
+    window.btn_plus_step.click()
+    wait_for_ui(lambda: window._step_countdown_timer.isActive())
+    assert window._step_countdown_timer.isActive() is True
+
+    window._step_delta(-1)
+    wait_for_ui(lambda: not window._step_is_busy())
+    assert window._step_countdown_timer.isActive() is False
+    assert window.hub.environment.load_enabled is False
+    assert window.hub.environment.current_set == 0.0
+
+    step_cancel_meas = window.store.get_run_measurements(step_cancel_run_id)
+    assert len(step_cancel_meas) == 1
+    assert step_cancel_meas[0]["RequestedIout_A"] == 2.0
 
     window.close()
 
@@ -2372,16 +2708,11 @@ def test_set_current_mode_delayed_auto_recording(tmp_path: Path):
     assert "✓ RECORDED · 15.00 A" in window.direct_status_lbl.text()
     assert window.btn_direct_set.isEnabled() is True
 
-    # 4. Test Post-Record Superseding: Click manual Save Reading again on the 15 A point
-    prior_measurements = window.store.get_run_measurements(window._manual_run_id)
-    assert len(prior_measurements) >= 1
-    window.manual_save_btn.click()
-    wait_for_ui(lambda: len(window.store.get_run_measurements(window._manual_run_id)) >= 2 and not window._manual_is_busy())
-
-    updated_measurements = window.store.get_run_measurements(window._manual_run_id)
-    statuses = [m["Status"] for m in updated_measurements]
-    assert "Superseded" in statuses
-    assert "Valid" in statuses
+    # 4. Each SET CURRENT action is a complete single-point run with a useful full name.
+    assert window._manual_run_id == ""
+    set_runs = [run for run in window.store.list_runs() if run["Mode"] == "Set Current"]
+    assert any("_SetCurrent_17A" in run["CampaignName"] for run in set_runs)
+    assert any("_SetCurrent_15A" in run["CampaignName"] for run in set_runs)
 
     # 5. Test Safety ZERO / OFF cancellation during settling
     window.manual_target_spin.setValue(20.0)
@@ -3122,6 +3453,11 @@ def test_manual_mode_range_and_plot_scaling_authority():
     x_range_step = window.live_plot_widget.getPlotItem().getViewBox().viewRange()[0]
     assert x_range_step[1] >= 79.9
 
+    # Restore default 60 A limit
+    window.load_card.cap_spin.setValue(60.0)
+    window.load_card.apply_cap_btn.click()
+    assert window.cap_val == 60.0
+
     window.close()
 
 
@@ -3234,11 +3570,160 @@ def test_bench_discovery_connection_state_transitions_and_psu_semantics():
     window.close()
 
 
+def test_chroma_63206a_scpi_commands_bench_diagnostics_and_run_behavior(tmp_path: Path, monkeypatch):
+    """Verify verified SCPI command set, temporary front-panel local restoration, Bench diagnostics vs run measurement separation, and partial read behavior."""
+    import os
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets, QtCore
+    from sid_bench_gui import MainWindow, LoadCard, WorkbookStore, calculate_measurement, MEAS_HEADERS
+    from sid_instruments import Chroma63206A, VisaManager, InstrumentSnapshot, InstrumentError
 
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
 
+    # 1. Test Chroma63206A SCPI commands and front-panel restoration
+    commands_written = []
+    queries_made = []
 
+    class MockSession:
+        timeout = 3000
+        def __init__(self):
+            self.closed = False
 
+        def write(self, cmd: str):
+            commands_written.append(cmd)
 
+        def query(self, cmd: str):
+            queries_made.append(cmd)
+            if cmd == "*IDN?":
+                return "Chroma,63206A-60-1000,12345,1.0"
+            elif cmd == "MEASure:CURRent?":
+                return "15.250"
+            elif cmd == "MEASure:VOLTage?":
+                return "11.950"
+            elif cmd == "SYST:ERR?":
+                return "+0, \"No error\""
+            return "0.0"
+
+        def close(self):
+            self.closed = True
+
+    mock_sess = MockSession()
+
+    class MockRM:
+        def open_resource(self, addr):
+            return mock_sess
+
+    mgr = VisaManager()
+    mgr._rm = MockRM()
+    load = Chroma63206A(mgr, "GPIB0::2::INSTR", ("63206",))
+
+    # A. Verify local_commands override contains ONLY SYSTem:LOCal
+    assert load.local_commands() == ("SYSTem:LOCal",)
+
+    # B. Set current and input: Write commands only (no query)
+    load.set_current(15.25)
+    assert "MODE CCH" in commands_written
+    assert "CURRent:STATic:L1 15.25" in commands_written
+
+    load.set_input(True)
+    assert "LOAD ON" in commands_written
+    load.set_input(False)
+    assert "LOAD OFF" in commands_written
+
+    # C. read_snapshot(include_voltage=True) for Bench Setup
+    commands_written.clear()
+    queries_made.clear()
+    snap = load.read_snapshot(include_voltage=True)
+    assert "MEASure:CURRent?" in queries_made
+    assert "MEASure:VOLTage?" in queries_made
+    assert snap.values["current"] == 15.25
+    assert snap.values["voltage"] == 11.95
+    assert abs(snap.values["power"] - (15.25 * 11.95)) < 1e-4
+    assert snap.status == "Connected"
+    # Temporary session closed and restored local front-panel
+    assert "SYSTem:LOCal" in commands_written
+
+    # D. read_snapshot(include_voltage=False) for Run Measurements: skips voltage query
+    commands_written.clear()
+    queries_made.clear()
+    run_snap = load.read_snapshot(include_voltage=False)
+    assert "MEASure:CURRent?" in queries_made
+    assert "MEASure:VOLTage?" not in queries_made
+    assert run_snap.values["current"] == 15.25
+    assert run_snap.values["voltage"] is None
+    assert run_snap.values["power"] is None
+    assert run_snap.status == "Connected"
+
+    # E. Partial read behavior: MEASure:VOLTage? fails while MEASure:CURRent? succeeds
+    def fail_voltage_query(cmd: str):
+        queries_made.append(cmd)
+        if cmd == "*IDN?":
+            return "Chroma,63206A-60-1000,12345,1.0"
+        elif cmd == "MEASure:CURRent?":
+            return "15.250"
+        elif cmd == "MEASure:VOLTage?":
+            raise RuntimeError("VI_ERROR_TMO: Timeout expired")
+        return "0.0"
+
+    mock_sess.query = fail_voltage_query
+    partial_snap = load.read_snapshot(include_voltage=True)
+    assert partial_snap.valid is True
+    assert partial_snap.values["current"] == 15.25
+    assert partial_snap.values["voltage"] is None
+    assert partial_snap.values["power"] is None
+    assert partial_snap.status == "Connected · Partial Read"
+    assert "failed" in partial_snap.warning
+
+    # 2. Test LoadCard UI rendering of diagnostic values and Partial Read
+    window = MainWindow()
+    load_card = window.load_card
+    load_card.last_snapshot = partial_snap
+    load_card._render_values()
+
+    assert load_card.metric_labels["Iout"].text() == "15.25 A"
+    assert load_card.metric_labels["Load V"].text() == "—"
+    assert load_card.metric_labels["Load P"].text() == "—"
+    assert load_card.status_badge.text() == "Connected · Partial Read"
+
+    # Full snapshot rendering
+    load_card.last_snapshot = snap
+    load_card._render_values()
+    assert load_card.metric_labels["Iout"].text() == "15.25 A"
+    assert load_card.metric_labels["Load V"].text() == "11.95 V"
+    assert "182.24 W" in load_card.metric_labels["Load P"].text()
+    assert load_card.status_badge.text() == "Connected"
+
+    # Release All Devices tooltip check
+    window._release_all_devices()
+    QtCore.QThreadPool.globalInstance().waitForDone(3000)
+    QtWidgets.QApplication.processEvents()
+    assert load_card.status_badge.text() == "Released"
+    assert load_card.status_badge.toolTip() == "VISA session closed · front panel restored"
+
+    # 3. Experiment Data Topology: Workbook row verification
+    excel_path = tmp_path / "chroma_topology_test.xlsx"
+    store = WorkbookStore(excel_path)
+    window.store = store
+
+    # Calculate measurement and verify authoritative experiment quantities
+    pa_snap = InstrumentSnapshot("pa", {"vin": 48.0, "iin": 2.5, "vout": 12.0})
+    derived, warnings = calculate_measurement(pa_snap, run_snap, None, [])
+
+    assert derived["Iout_A"] == 15.25
+    assert derived["Vin_V"] == 48.0
+    assert derived["Iin_A"] == 2.5
+    assert derived["Vout_V"] == 12.0
+    assert derived["PinConverter_W"] == 120.0  # 48 * 2.5
+    assert derived["Pout_W"] == 183.0  # 12.0 * 15.25
+    assert abs(derived["EfficiencyConverter_pct"] - (183.0 / 120.0 * 100.0)) < 1e-4
+
+    # Verify diagnostic Load V / Load P are NOT present in derived measurement or MEAS_HEADERS
+    assert "Load V" not in derived
+    assert "Load P" not in derived
+    assert "ChromaLoadVoltage" not in MEAS_HEADERS
+    assert "ChromaLoadPower" not in MEAS_HEADERS
+
+    window.close()
 
 
 

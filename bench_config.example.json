@@ -1,10 +1,13 @@
 {
   "schema": 5,
-  "campaign_name": "SID efficiency test",
+  "campaign_name": "Converter efficiency test",
   "working_current_cap_a": 20.0,
   "last_modulation_label": "",
   "recent_modulations": [],
-  "workbook": "results/SID_APEC_extension.xlsx",
+  "workbooks": {
+    "hardware": "results/hardware_measurements.xlsx",
+    "simulation": "results/simulation_runs.xlsx"
+  },
   "fpga_root": "",
   "visa_library": "C:\\Windows\\System32\\visa64.dll",
   "addresses": {

@@ -218,6 +218,16 @@ class VisaInstrument:
             raise exc
         raise InstrumentError(f"{self.kind} communication failed: {text}") from exc
 
+    def _return_to_local_if_supported(self) -> bool:
+        if self._session is not None:
+            for command in self.local_commands():
+                try:
+                    self._session.write(command)
+                    return True
+                except Exception:
+                    continue
+        return False
+
     @contextmanager
     def session(self):
         temporary = False
@@ -228,10 +238,13 @@ class VisaInstrument:
             try:
                 yield self._session
             except Exception as exc:
+                if temporary and not self._persistent:
+                    self._return_to_local_if_supported()
                 self._close_locked()
                 self._raise_clean(exc)
             finally:
                 if temporary and not self._persistent:
+                    self._return_to_local_if_supported()
                     self._close_locked()
 
     def _close_locked(self) -> None:
@@ -245,13 +258,7 @@ class VisaInstrument:
 
     def release(self) -> None:
         with self._lock:
-            if self._session is not None:
-                for command in self.local_commands():
-                    try:
-                        self._session.write(command)
-                        break
-                    except Exception:
-                        continue
+            self._return_to_local_if_supported()
             self._close_locked()
 
     def local_commands(self) -> tuple[str, ...]:
@@ -264,18 +271,49 @@ class VisaInstrument:
 class Chroma63206A(VisaInstrument):
     kind = "Chroma 63206A"
 
-    def read_snapshot(self, **_: Any) -> InstrumentSnapshot:
+    def local_commands(self) -> tuple[str, ...]:
+        return ("SYSTem:LOCal",)
+
+    def read_snapshot(self, include_voltage: bool = True, **_: Any) -> InstrumentSnapshot:
         with self.session() as dev:
-            current = finite_float(dev.query("MEASure:CURRent?"), "load current")
-            warning = ""
             try:
-                voltage = finite_float(dev.query("MEASure:VOLTage?"), "load voltage")
-            except InstrumentError as exc:
-                voltage = None
-                warning = str(exc)
-        return InstrumentSnapshot(
-            "load", {"current": current, "voltage": voltage, "power": current * voltage if voltage is not None else None}, warning=warning
-        )
+                current_raw = dev.query("MEASure:CURRent?")
+                current = finite_float(current_raw, "load current")
+            except Exception as exc:
+                err_msg = str(exc)
+                try:
+                    syst_err = str(dev.query("SYST:ERR?")).strip()
+                    if syst_err and not syst_err.startswith("+0") and not syst_err.startswith("0"):
+                        err_msg += f" (Chroma error: {syst_err})"
+                except Exception:
+                    pass
+                raise InstrumentError(f"Chroma current measurement failed: {err_msg}") from exc
+
+            voltage = None
+            warning = ""
+            if include_voltage:
+                try:
+                    voltage_raw = dev.query("MEASure:VOLTage?")
+                    voltage = finite_float(voltage_raw, "load voltage")
+                except Exception as exc:
+                    voltage = None
+                    warning = f"Load voltage query failed: {exc}"
+
+            power = (current * voltage) if voltage is not None else None
+            status = "Connected · Partial Read" if (include_voltage and voltage is None) else "Connected"
+
+            return InstrumentSnapshot(
+                "load",
+                {"current": current, "voltage": voltage, "power": power},
+                valid=True,
+                warning=warning,
+                status=status,
+            )
+
+    def read_run_current(self) -> float:
+        """Query only run-critical load current, skipping diagnostic voltage queries."""
+        with self.session() as dev:
+            return finite_float(dev.query("MEASure:CURRent?"), "load current")
 
     def set_current(self, amps: float) -> None:
         amps = finite_float(amps, "requested load current")
@@ -592,11 +630,16 @@ class SimInstrument:
 
 
 class SimLoad(SimInstrument):
-    def read_snapshot(self, **_: Any) -> InstrumentSnapshot:
+    def read_snapshot(self, include_voltage: bool = True, **_: Any) -> InstrumentSnapshot:
         self.env.advance()
         current = self.env.current
-        voltage = max(0.0, 12.05 - 0.0012 * current)
-        return InstrumentSnapshot("load", {"current": current, "voltage": voltage, "power": current * voltage})
+        voltage = max(0.0, 12.05 - 0.0012 * current) if include_voltage else None
+        power = (current * voltage) if voltage is not None else None
+        return InstrumentSnapshot("load", {"current": current, "voltage": voltage, "power": power})
+
+    def read_run_current(self) -> float:
+        self.env.advance()
+        return self.env.current
 
     def set_current(self, amps: float) -> None:
         self.env.current_set = float(amps)

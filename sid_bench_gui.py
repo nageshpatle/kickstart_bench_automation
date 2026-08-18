@@ -45,7 +45,8 @@ from sid_instruments import (
 ROOT = Path(__file__).resolve().parent
 INSTRUMENTS_DIR = ROOT / "instruments"
 CONFIG_PATH = ROOT / "bench_config.json"
-DEFAULT_WORKBOOK = ROOT / "results" / "converter_bench_data.xlsx"
+DEFAULT_HARDWARE_WORKBOOK = ROOT / "results" / "hardware_measurements.xlsx"
+DEFAULT_SIMULATION_WORKBOOK = ROOT / "results" / "simulation_runs.xlsx"
 DEFAULT_FPGA_ROOT = ROOT.parent / "KICKSTART_PILAWA"
 
 # Berkeley Blue & California Gold Design Tokens (matching Kickstart PILAWA GUI)
@@ -121,7 +122,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "working_current_cap_a": 70.0,
     "last_modulation_label": "",
     "recent_modulations": [],
-    "workbook": str(DEFAULT_WORKBOOK),
+    "workbooks": {
+        "hardware": str(DEFAULT_HARDWARE_WORKBOOK),
+        "simulation": str(DEFAULT_SIMULATION_WORKBOOK),
+    },
     "fpga_root": str(DEFAULT_FPGA_ROOT),
     "visa_library": r"C:\Windows\System32\visa64.dll",
     "addresses": {
@@ -141,8 +145,7 @@ RUN_HEADERS = [
     "RunID", "CampaignName", "Created", "Completed", "Status", "DataSource", "Mode", "VinTarget_V",
     "ModulationLabel", "Frequency_Hz", "ModulationMetadata",
     "AuxA_Included", "AuxB_Included", "AuxC_Included",
-    "SupplyConfiguration",
-    "Length_mm", "Width_mm", "Height_mm", "WorkingCap_A", "Notes", "InstrumentIdentities",
+    "SupplyConfiguration", "WorkingCap_A", "Notes", "InstrumentIdentities",
     "FPGASnapshotStatus", "FPGASnapshot", "Warnings", "SupersedesRunID",
 ]
 
@@ -154,7 +157,7 @@ MEAS_HEADERS = [
     "Vdrv_B_V", "Idrv_B_A", "Pdrv_B_W",
     "Vdrv_C_V", "Idrv_C_A", "Pdrv_C_W",
     "Paux_W", "LossConverter_W", "LossSystem_W",
-    "EfficiencyConverter_pct", "EfficiencySystem_pct", "PowerDensity_W_per_in3",
+    "EfficiencyConverter_pct", "EfficiencySystem_pct",
     "SupplyMeasurements", "Quality", "Warning", "ScopeCaptureStatus", "ScopeCaptureError",
     "ScopePNG", "ScopeCSV", "SupersedesPointID",
 ]
@@ -174,14 +177,25 @@ def deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
 
 def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
-        return json.loads(json.dumps(DEFAULT_CONFIG))
-    try:
-        return deep_merge(DEFAULT_CONFIG, json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
-    except Exception:
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+    else:
+        try:
+            config = deep_merge(DEFAULT_CONFIG, json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        except Exception:
+            config = json.loads(json.dumps(DEFAULT_CONFIG))
+    workbook_override = os.environ.get("KICKSTART_WORKBOOK_PATH", "").strip()
+    if workbook_override:
+        base = Path(workbook_override)
+        config["workbooks"] = {
+            "hardware": str(base),
+            "simulation": str(base.with_name(f"{base.stem}_simulation{base.suffix}")),
+        }
+    return config
 
 
 def save_config(config: dict[str, Any]) -> None:
+    if os.environ.get("KICKSTART_WORKBOOK_PATH", "").strip():
+        return
     CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
@@ -309,13 +323,32 @@ def fpga_snapshot(fpga_root: Path, expected_frequency: float | None = None) -> t
 
 
 class WorkbookStore:
-    """Campaign workbook with atomic replacement, backup, validation, and corruption recovery."""
+    """Single campaign workbook with durable staging and validated commits.
+
+    A cloud-synced or Excel-open workbook can temporarily reject replacement.  In that
+    case the newest complete workbook is retained in one local pending file and used as
+    the authoritative source until it can be committed.  We never create per-save
+    fallback workbooks and never stream-copy over the live XLSX.
+    """
 
     def __init__(self, path: Path, prompt_fn: Callable[[str, str], bool] | None = None):
         self.path = Path(path)
         self._prompt_fn = prompt_fn
         self._lock = threading.RLock()
         self.last_warning = ""
+
+    @property
+    def pending_path(self) -> Path:
+        root = Path(os.environ.get("LOCALAPPDATA", str(self.path.parent))) / "KickstartBench" / "pending"
+        key = hashlib.sha256(str(self.path.resolve()).casefold().encode("utf-8")).hexdigest()[:20]
+        return root / f"{key}.pending.xlsx"
+
+    @staticmethod
+    def _validate_xlsx(path: Path) -> None:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True)
+        _ = wb.sheetnames
+        wb.close()
 
     def _ask_user(self, title: str, message: str, default_yes: bool = True) -> bool:
         if self._prompt_fn is not None:
@@ -345,16 +378,27 @@ class WorkbookStore:
             raise RuntimeError("openpyxl is required; run bench_test.py --install") from exc
 
         backup_path = self.path.with_suffix(self.path.suffix + ".bak")
+        pending_path = self.pending_path
         is_new = not self.path.exists()
 
-        if is_new or self.path.stat().st_size == 0:
+        if pending_path.exists() and pending_path.stat().st_size > 0:
+            try:
+                workbook = load_workbook(pending_path)
+                _ = workbook.sheetnames
+                self.last_warning = (
+                    f"Workbook changes are safely queued and visible in History, but {self.path.name} "
+                    "is still busy. Close it in Excel so the next save can commit them."
+                )
+            except (zipfile.BadZipFile, KeyError, ValueError, OSError, EOFError) as pending_exc:
+                raise RuntimeError(f"Pending workbook state is unreadable: {pending_path}") from pending_exc
+        elif is_new or self.path.stat().st_size == 0:
             workbook = Workbook()
             workbook.remove(workbook.active)
         else:
             try:
                 workbook = load_workbook(self.path)
                 _ = workbook.sheetnames
-            except (zipfile.BadZipFile, KeyError, ValueError, OSError, Exception) as load_exc:
+            except (zipfile.BadZipFile, KeyError, ValueError, OSError, EOFError) as load_exc:
                 self.last_warning = "Results workbook could not be read. The XLSX file appears damaged. No hardware fault occurred."
 
                 # Check whether the existing .bak backup is readable with openpyxl.load_workbook()
@@ -521,20 +565,17 @@ class WorkbookStore:
                     e_sheet = workbook["Events"]
                     for evt in events_to_log:
                         e_sheet.append([WorkbookStore._as_cell(evt.get(name, "")) for name in EVENT_HEADERS])
-                try:
-                    workbook.save(self.path)
-                except Exception:
-                    pass
-
         return workbook
 
     @staticmethod
     def _as_cell(value: Any) -> Any:
         return json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else value
 
-    def _save_atomic(self, workbook) -> None:
+    def _save_atomic(self, workbook) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_suffix(".tmp.xlsx")
+        pending = self.pending_path
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        temp = pending.with_name(f"{pending.stem}.{uuid.uuid4().hex}.tmp.xlsx")
         backup = self.path.with_suffix(self.path.suffix + ".bak")
         self.last_warning = ""
 
@@ -552,33 +593,71 @@ class WorkbookStore:
 
         try:
             workbook.save(temp)
-            # Validate newly written temporary XLSX with openpyxl.load_workbook(temp, read_only=True)
-            from openpyxl import load_workbook
-            test_wb = load_workbook(temp, read_only=True)
-            _ = test_wb.sheetnames
-            test_wb.close()
+            self._validate_xlsx(temp)
+            os.replace(temp, pending)
 
-            # Only replace live workbook after the temporary file has passed validation
+            # Build a complete candidate beside the live workbook.  Replacing a file in
+            # its own directory is atomic when the filesystem permits it.
+            candidate = self.path.with_name(f".{self.path.stem}.{uuid.uuid4().hex}.commit.xlsx")
+            shutil.copy2(pending, candidate)
+            self._validate_xlsx(candidate)
+
             if self.path.exists():
                 try:
+                    self._validate_xlsx(self.path)
                     shutil.copy2(self.path, backup)
                 except Exception:
                     pass
-            os.replace(temp, self.path)
-        except (PermissionError, OSError) as exc:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            fallback = self.path.parent / f"fallback_{stamp}_{self.path.name}"
+
+            commit_error: OSError | None = None
+            for delay in (0.0, 0.05, 0.15, 0.30):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    os.replace(candidate, self.path)
+                    commit_error = None
+                    break
+                except OSError as exc:
+                    commit_error = exc
+
+            if commit_error is not None:
+                candidate.unlink(missing_ok=True)
+                self.last_warning = (
+                    f"Could not update {self.path.name} because it is open or temporarily locked. "
+                    "All changes are safely queued in one pending state and remain visible in History. "
+                    "Close the workbook in Excel; the next save will retry."
+                )
+                return False
+
             try:
-                workbook.save(fallback)
-                self.last_warning = f"Excel locked workbook. Saved to fallback: {fallback.name}"
-            except Exception as f_err:
-                self.last_warning = f"Could not save fallback: {f_err}"
+                self._validate_xlsx(self.path)
+            except Exception as live_exc:
+                self.last_warning = (
+                    f"Committed workbook failed final validation; the complete pending state was preserved at {pending}."
+                )
+                raise RuntimeError(self.last_warning) from live_exc
+
+            pending.unlink(missing_ok=True)
+            return True
         except Exception as val_exc:
             try:
                 temp.unlink(missing_ok=True)
             except Exception:
                 pass
+            try:
+                if 'candidate' in locals():
+                    candidate.unlink(missing_ok=True)
+            except Exception:
+                pass
             raise RuntimeError(f"Failed to validate temporary workbook before commit: {val_exc}") from val_exc
+
+    def preflight(self, require_live_commit: bool = True) -> None:
+        """Validate/recover the store before a sweep is allowed to start."""
+        with self._lock:
+            wb = self._load()
+            committed = self._save_atomic(wb)
+            if require_live_commit and not committed:
+                raise RuntimeError(self.last_warning)
 
     @staticmethod
     def _append(sheet, headers: list[str], record: dict[str, Any]) -> None:
@@ -635,7 +714,9 @@ class WorkbookStore:
             self._save_atomic(wb)
 
     def _matching_rows(self, sheet, record: dict[str, Any]) -> list[int]:
-        indices = {name: MEAS_HEADERS.index(name) + 1 for name in ("DataSource", "VinTarget_V", "ModulationLabel", "Frequency_Hz", "RequestedIout_A")}
+        # A point is only a duplicate inside the same run type.  A 2 A pulse is
+        # not interchangeable with a 2 A continuous or manual measurement.
+        indices = {name: MEAS_HEADERS.index(name) + 1 for name in ("DataSource", "Mode", "VinTarget_V", "ModulationLabel", "Frequency_Hz", "RequestedIout_A")}
         matches: list[int] = []
         for row in range(2, sheet.max_row + 1):
             equal = True
@@ -647,7 +728,7 @@ class WorkbookStore:
                     except (TypeError, ValueError):
                         equal = False
                 else:
-                    equal = old == new
+                    equal = (old == new) or (str(old or "") == str(new or ""))
                 if not equal:
                     break
             if equal and sheet.cell(row, MEAS_HEADERS.index("Status") + 1).value in {"Valid", "Invalid"}:
@@ -683,6 +764,23 @@ class WorkbookStore:
             self._append(wb["Events"], EVENT_HEADERS, {"Timestamp": utc_now(), "RunID": run_id, "Event": f"Run {status}", "Detail": warning})
             self._refresh_plot(wb)
             self._save_atomic(wb)
+
+    def update_run_fields(self, run_id: str, fields: dict[str, Any]) -> bool:
+        """Update display metadata for an existing run without changing its identity."""
+        allowed = {name for name in fields if name in RUN_HEADERS and name != "RunID"}
+        if not allowed:
+            return False
+        with self._lock:
+            wb = self._load()
+            sheet = wb["Runs"]
+            id_col = RUN_HEADERS.index("RunID") + 1
+            for row in range(2, sheet.max_row + 1):
+                if str(sheet.cell(row, id_col).value or "").strip() == run_id:
+                    for name in allowed:
+                        sheet.cell(row, RUN_HEADERS.index(name) + 1).value = self._as_cell(fields[name])
+                    self._save_atomic(wb)
+                    return True
+        return False
 
     def _refresh_plot(self, wb) -> None:
         from openpyxl.chart import ScatterChart, Reference, Series
@@ -863,7 +961,7 @@ def calculate_measurement(
     load: InstrumentSnapshot,
     psu: InstrumentSnapshot | None,
     supply_channels: list[SupplyChannel],
-    dimensions_mm: tuple[float, float, float] = (24.0, 16.0, 3.4),
+    dimensions_mm: tuple[float, float, float] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = [warning for warning in (pa.warning, load.warning, psu.warning if psu else "") if warning]
     if not pa.valid or not load.valid or (psu is not None and not psu.valid):
@@ -940,9 +1038,8 @@ def calculate_measurement(
     else:
         warnings.append("PSU measurement unavailable; auxiliary loss is incomplete")
 
-    volume = dimensions_mm[0] * dimensions_mm[1] * dimensions_mm[2] / (25.4 ** 3)
-    if pin <= 0 or volume <= 0:
-        return {}, warnings + ["Nonpositive input power or volume; derived values left blank"]
+    if pin <= 0:
+        return {}, warnings + ["Nonpositive input power; derived values left blank"]
 
     loss_converter = pin - pout
     system_pin = pin + paux
@@ -957,7 +1054,6 @@ def calculate_measurement(
         "Paux_W": paux, "LossConverter_W": loss_converter, "LossSystem_W": loss_system,
         "EfficiencyConverter_pct": 100.0 * pout / pin,
         "EfficiencySystem_pct": 100.0 * pout / system_pin if system_pin > 0 else None,
-        "PowerDensity_W_per_in3": pout / volume,
         "SupplyMeasurements": supply_result,
     }
     if derived["EfficiencyConverter_pct"] > 100.0:
@@ -1691,7 +1787,7 @@ class LoadCard(QtWidgets.QGroupBox):
         self.read_btn.setText("Reading...")
 
         def query():
-            return self.hub.instruments["load"].read_snapshot()
+            return self.hub.instruments["load"].read_snapshot(include_voltage=True)
 
         def on_done(snap: InstrumentSnapshot):
             self.released = False
@@ -1723,16 +1819,20 @@ class LoadCard(QtWidgets.QGroupBox):
         if self.last_snapshot.valid:
             style = f"font-family: Consolas, monospace; font-size: 13px; font-weight: 600; color: {TEXT_MUTED};" if is_rel else f"font-family: Consolas, monospace; font-size: 13px; font-weight: 700; color: {BERKELEY_BLUE};"
             tip = "Last reading before release" if is_rel else ""
+            cur = vals.get("current") if "current" in vals else vals.get("iout")
+            volt = vals.get("voltage") if "voltage" in vals else vals.get("vout")
+            pwr = vals.get("power") if "power" in vals else vals.get("pout")
+
             if "Iout" in self.metric_labels:
-                self.metric_labels["Iout"].setText(f"{float(vals.get('iout', 0.0)):.2f} A" if vals.get('iout') is not None else "—")
+                self.metric_labels["Iout"].setText(f"{float(cur):.2f} A" if cur is not None else "—")
                 self.metric_labels["Iout"].setStyleSheet(style)
                 self.metric_labels["Iout"].setToolTip(tip)
             if "Load V" in self.metric_labels:
-                self.metric_labels["Load V"].setText(f"{float(vals.get('vout', 0.0)):.2f} V" if vals.get('vout') is not None else "—")
+                self.metric_labels["Load V"].setText(f"{float(volt):.2f} V" if volt is not None else "—")
                 self.metric_labels["Load V"].setStyleSheet(style)
                 self.metric_labels["Load V"].setToolTip(tip)
             if "Load P" in self.metric_labels:
-                self.metric_labels["Load P"].setText(f"{float(vals.get('pout', 0.0)):.2f} W" if vals.get('pout') is not None else "—")
+                self.metric_labels["Load P"].setText(f"{float(pwr):.2f} W" if pwr is not None else "—")
                 self.metric_labels["Load P"].setStyleSheet(style)
                 self.metric_labels["Load P"].setToolTip(tip)
 
@@ -1750,7 +1850,9 @@ class LoadCard(QtWidgets.QGroupBox):
                         f"font-family: Consolas, monospace; font-size: 13px; font-weight: 800; color: {SUCCESS_GREEN if in_on else TEXT_MUTED};"
                     )
             if not is_rel:
-                self._set_badge("green", "Connected", f"Connected · {datetime.now().strftime('%H:%M:%S')}")
+                status_text = getattr(self.last_snapshot, "status", "") or "Connected"
+                badge_color = "amber" if "Partial" in status_text else "green"
+                self._set_badge(badge_color, status_text, f"{status_text} · {datetime.now().strftime('%H:%M:%S')}")
         else:
             if not is_rel:
                 status_text = getattr(self.last_snapshot, "status", "") or "Connected · Read Error"
@@ -1776,7 +1878,7 @@ class LoadCard(QtWidgets.QGroupBox):
 
     def _mark_released(self):
         self.released = True
-        self._set_badge("gray", "Released", "Load released; session idle")
+        self._set_badge("gray", "Released", "VISA session closed · front panel restored")
         self._render_values()
 
 
@@ -2488,7 +2590,7 @@ class SweepWorker(QtCore.QThread):
             if self.stop_event.is_set():
                 raise InterruptedError("Operator stop and return to zero")
             pa_snap = self.hub.instruments["pa"].read_snapshot()
-            load_snap = self.hub.instruments["load"].read_snapshot()
+            load_snap = self.hub.instruments["load"].read_snapshot(include_voltage=False)
             psu_snap = None
             try:
                 psu_snap = self.hub.instruments["psu"].read_snapshot(channels=channels)
@@ -2508,7 +2610,7 @@ class SweepWorker(QtCore.QThread):
             if self.stop_event.is_set():
                 raise InterruptedError("Operator stop and return to zero")
             pa_values.append(self.hub.instruments["pa"].read_snapshot().values)
-            load_values.append(self.hub.instruments["load"].read_snapshot().values)
+            load_values.append(self.hub.instruments["load"].read_snapshot(include_voltage=False).values)
             try:
                 psu_values.append(self.hub.instruments["psu"].read_snapshot(channels=channels).values)
             except Exception as exc:
@@ -2535,6 +2637,10 @@ class SweepWorker(QtCore.QThread):
         load = self.hub.instruments["load"]
         last_commanded_amps = 0.0
         try:
+            # Persist the run envelope before any instrument connection or load command.
+            # The finalizer below updates this same row on success, stop, or abort.
+            if not self.store.create_run(self.settings["run_record"]):
+                raise RuntimeError(f"RunID already exists: {run_id}")
             for required in ("pa", "load"):
                 self.hub.instruments[required].connect(persistent=True)
             if self.settings["psu_required"]:
@@ -2542,7 +2648,6 @@ class SweepWorker(QtCore.QThread):
             self.settings["run_record"]["InstrumentIdentities"] = {
                 key: getattr(inst, "identity", "") for key, inst in self.hub.instruments.items()
             }
-            self.store.create_run(self.settings["run_record"])
             points = self.settings["points"]
             self.state_changed.emit("RUNNING", "Test sequence in progress")
 
@@ -2579,7 +2684,7 @@ class SweepWorker(QtCore.QThread):
 
                 # Execute measurement near the end of the dwell
                 pa_snap, load_snap, psu_snap = self._measure_average(self.settings["sample_count"], measure_last)
-                derived, point_warnings = calculate_measurement(pa_snap, load_snap, psu_snap, self.settings["supply_channels"], self.settings["dimensions"])
+                derived, point_warnings = calculate_measurement(pa_snap, load_snap, psu_snap, self.settings["supply_channels"])
 
                 pid = point_id(run_id, index)
                 capture_status, capture_error, png_value, csv_value = "Skipped", "", "", ""
@@ -2696,7 +2801,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_chrome_applied = False
         self.config = load_config()
         self.hub = InstrumentHub(False, self.config)
-        self.store = WorkbookStore(Path(self.config["workbook"]))
+        workbook_paths = self.config["workbooks"]
+        self.hardware_store = WorkbookStore(Path(workbook_paths["hardware"]))
+        self.simulation_store = WorkbookStore(Path(workbook_paths["simulation"]))
+        self.store = self.hardware_store
         self.worker: SweepWorker | None = None
         self.demo_timer: QtCore.QTimer | None = None
         self.demo_index = 0
@@ -2708,6 +2816,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bench_operation_busy = False
 
         # Unified Manual / Step Current auto-recording state
+        self._manual_step_action = "idle"
         self._manual_point_token = 0
         self._manual_countdown_timer = QtCore.QTimer(self)
         self._manual_countdown_timer.setInterval(100)
@@ -2721,6 +2830,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._manual_last_record: dict[str, Any] | None = None
         self._manual_active_task = False
         self._manual_mode_name = "Set Current"
+        self._manual_point_index = -1
+        self._manual_run_created = False
+        self._manual_run_label = ""
+        self._manual_base_campaign = ""
+        self._manual_recorded_currents: list[float] = []
+        self._manual_any_invalid = False
+        self._manual_store: WorkbookStore | None = None
+        self._selected_mode_id: int | None = None
 
         self.setWindowTitle("KICKSTART BENCH")
 
@@ -3153,6 +3270,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def emergency_stop_action(self):
         """Immediate emergency abort without gradual ramp."""
         self._cancel_manual_automation("0.00 A · OFF")
+        self._finalize_manual_session("Emergency LOAD OFF", status_override="Stopped")
+        self._clear_live_run_view()
         if self.demo_timer and self.demo_timer.isActive():
             self.demo_timer.stop()
             self._demo_completed("Aborted")
@@ -4212,12 +4331,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.plot_progress_marker.set_range(self.cont_start.value(), self.cont_stop.value())
 
     def _mode_selected(self, button_id: int):
+        previous = self._selected_mode_id
+        if previous is not None and previous != button_id:
+            self._finalize_manual_session("Mode changed")
+            self._clear_live_run_view()
+        self._selected_mode_id = button_id
         self.run_stack.setCurrentIndex(button_id)
         # button_id 0 = SET CURRENT (Manual)
         # button_id 1 = STEP CURRENT (Manual)
         # button_id 2 = CONTINUOUS
         # button_id 3 = PULSE
-        modes = ["Manual", "Manual", "Continuous", "Pulse"]
+        modes = ["Set Current", "Step Current", "Continuous", "Pulse"]
         mode_str = modes[button_id] if button_id < len(modes) else "Continuous"
         if hasattr(self, "mode_indicator"):
             self.mode_indicator.set_mode(mode_str)
@@ -4334,6 +4458,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_live_plot_view(self):
         self._switch_live_plot(self.live_metric_combo.currentIndex())
 
+    def _clear_live_run_view(self):
+        """Clear data/status that belongs to the previous logical run."""
+        self.plot_rows.clear()
+        if hasattr(self, "live_curve"):
+            self.live_curve.setData([], [])
+        if hasattr(self, "live_stat_tag"):
+            self.live_stat_tag.setText("READY ◌")
+            self.live_stat_tag.setStyleSheet(f"font-weight: 800; font-size: 12px; color: {TEXT_MUTED};")
+        if hasattr(self, "live_point_lbl"):
+            self.live_point_lbl.setText("Fresh run")
+        if hasattr(self, "live_cmd_lbl"):
+            self.live_cmd_lbl.setText("Command: 0 A")
+        if hasattr(self, "run_progress_bar"):
+            self.run_progress_bar.setRange(0, 1)
+            self.run_progress_bar.setValue(0)
+            self.run_progress_bar.setFormat("READY")
+        if hasattr(self, "strip_progress"):
+            self.strip_progress.setRange(0, 1)
+            self.strip_progress.setValue(0)
+            self.strip_progress.setFormat("READY")
+        if hasattr(self, "plot_progress_marker"):
+            self.plot_progress_marker.set_idle()
+        if hasattr(self, "live_plot_widget"):
+            self._reset_live_plot_view()
+
     def _switch_live_plot(self, index: int):
         specs = [
             ("EfficiencyConverter_pct", "Converter Efficiency", "%"),
@@ -4393,8 +4542,8 @@ class MainWindow(QtWidgets.QMainWindow):
         l_layout.setContentsMargins(10, 10, 10, 10)
         l_layout.setSpacing(8)
 
-        self.history_table = QtWidgets.QTableWidget(0, 8)
-        self.history_table.setHorizontalHeaderLabels(["Run Short ID", "RunID", "Test Name", "Status", "Source", "Vin", "Freq", "Modulation"])
+        self.history_table = QtWidgets.QTableWidget(0, 9)
+        self.history_table.setHorizontalHeaderLabels(["Run Short ID", "RunID", "Full Test Name", "Status", "Source", "Vin", "Freq", "Base Test", "Mode"])
         self.history_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.history_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
@@ -4492,7 +4641,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 run_id = self.history_table.item(row, 1).text()
             if not run_id:
                 continue
-            meas = self.store.get_run_measurements(run_id)
+            meas = self._store_for_history_row(row).get_run_measurements(run_id)
             if not meas:
                 continue
             vin = self.history_table.item(row, 5).text() if self.history_table.item(row, 5) else ""
@@ -4527,7 +4676,7 @@ class MainWindow(QtWidgets.QMainWindow):
         run_id = self.history_table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
         if not run_id and self.history_table.item(row, 1):
             run_id = self.history_table.item(row, 1).text()
-        meas = self.store.get_run_measurements(run_id)
+        meas = self._store_for_history_row(row).get_run_measurements(run_id)
         if not meas:
             QtWidgets.QMessageBox.information(self, "Copy Run", f"No measurement records found for {run_id}.")
             return
@@ -4644,6 +4793,7 @@ class MainWindow(QtWidgets.QMainWindow):
         is_running = (self.worker is not None and self.worker.isRunning()) or (self.demo_timer is not None and self.demo_timer.isActive())
         is_sim = self.simulation.isChecked()
         mode_id = self.mode_group.checkedId()
+        manual_busy = self._manual_is_busy()
 
         # Emergency Stop Button Appearance
         if is_running:
@@ -4659,7 +4809,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Mode segmented buttons
         for rb in (self.btn_mode_direct, self.btn_mode_step, self.btn_mode_cont, self.btn_mode_pulse):
-            rb.setEnabled(not is_running)
+            rb.setEnabled(not is_running and not manual_busy)
 
         # Top Setup parameters
         for w in (self.test_name, self.vin_target, self.frequency, self.simulation, self.fpga_check, self.notes):
@@ -4688,7 +4838,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # SET CURRENT controls (mode 0)
         direct_active = (not is_running and mode_id == 0)
-        manual_busy = self._manual_is_busy()
         self.btn_direct_zero.setEnabled(direct_active)  # ZERO / OFF is safety action and NEVER disabled
         self.btn_direct_set.setEnabled(direct_active and not manual_busy)
         for w in (self.manual_target_spin, self.direct_auto_delay, self.direct_auto_save,
@@ -4722,20 +4871,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Start Sweep button
         can_start = not is_running
-        if not is_sim and not self.chk_load.isChecked():
-            can_start = False
-            self.run_sweep_btn.setToolTip("Verify low-current load control on the Bench tab first.")
-        else:
-            self.run_sweep_btn.setToolTip("Review parameters and begin automated sweep.")
         self.run_sweep_btn.setEnabled(can_start)
         if is_running:
             self.run_sweep_btn.setText("SWEEP RUNNING...")
         else:
             self._update_run_button_text()
+            if not is_sim and not self.chk_load.isChecked():
+                self.run_sweep_btn.setToolTip("Hardware write locked: Check 'I verified low-current load control on this bench' in Bench Setup first.")
+            else:
+                self.run_sweep_btn.setToolTip("Review parameters and begin automated sweep.")
 
 
 
     # ----------------- SLOTS & CORE OPERATIONS -----------------
+    def _store_for_source(self, source: str) -> WorkbookStore:
+        if getattr(self, "store", None) is not None:
+            return self.store
+        return self.simulation_store if str(source).strip().lower() == "simulation" else self.hardware_store
+
+    def _store_for_history_row(self, row: int) -> WorkbookStore:
+        if getattr(self, "store", None) is not None:
+            return self.store
+        source_item = self.history_table.item(row, 4)
+        return self._store_for_source(source_item.text() if source_item else "Hardware")
+
     def _supply_channels(self) -> list[SupplyChannel]:
         return [SupplyChannel(raw["channel"], raw.get("role", f"CH{raw['channel']}"), True, raw.get("enabled", False), raw.get("contributes_loss", True), raw.get("voltage_set", 0.0), None, raw.get("current_limit", 1.0), None) for raw in self.config["supply_channels"]]
 
@@ -4751,6 +4910,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hub.release_all()
         config = {**self.config, "simulation_scenario": "Nominal"}
         self.hub = InstrumentHub(enabled, config)
+        self.store = self.simulation_store if enabled else self.hardware_store
         self.supply_card.hub = self.hub
         self.scope_card.hub = self.hub
 
@@ -4879,21 +5039,39 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.live_act_lbl.setText(f"Actual: {current:.2f} A")
 
     def _validate_current(self, amps: float, current_value: float | None = None) -> bool:
-        if amps < 0 or amps > self.cap_val:
-            QtWidgets.QMessageBox.critical(self, "Current rejected", f"{amps:g} A exceeds maximum allowed current ({self.cap_val:g} A).")
+        cap = self.manual_mode_max_current() if hasattr(self, "manual_mode_max_current") else self.cap_val
+        if amps < 0 or amps > cap:
+            QtWidgets.QMessageBox.critical(self, "Current rejected", f"{amps:g} A exceeds maximum allowed current ({cap:g} A).")
             return False
-        ref = self.manual_current.value() if current_value is None else current_value
+        if current_value is not None:
+            ref = current_value
+        elif hasattr(self, "_manual_target_current"):
+            ref = self._manual_target_current
+        elif hasattr(self, "manual_target_spin"):
+            ref = self.manual_target_spin.value()
+        elif hasattr(self, "manual_current"):
+            ref = self.manual_current.value()
+        else:
+            ref = 0.0
         if amps >= 100 or abs(amps - ref) >= 50:
             ans = QtWidgets.QMessageBox.warning(self, "Large current command", f"Confirm command of {amps:g} A.", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No, QtWidgets.QMessageBox.StandardButton.No)
             return ans == QtWidgets.QMessageBox.StandardButton.Yes
         return True
 
+    def require_load_control_verified(self, action_name: str = "") -> bool:
+        if self.simulation.isChecked():
+            return True
+        if self.chk_load.isChecked():
+            return True
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Hardware write locked",
+            "Check 'I verified low-current load control on this bench' in Bench Setup first."
+        )
+        return False
+
     def _hardware_write_allowed(self) -> bool:
-        if self.simulation.isChecked(): return True
-        if not self.chk_load.isChecked():
-            QtWidgets.QMessageBox.warning(self, "Hardware write locked", "Check 'I verified low-current load control on this bench' in Bench tab first.")
-            return False
-        return True
+        return self.require_load_control_verified()
 
     def _run_function(self, function: Callable[[], Any], success: Callable[[Any], None] | None = None):
         task = FunctionTask(function)
@@ -4943,22 +5121,74 @@ class MainWindow(QtWidgets.QMainWindow):
     def _cancel_step_automation(self, status_text: str = "READY", quiet: bool = False):
         self._cancel_manual_automation(status_text, quiet)
 
-    def _start_manual_point_sequence(self, new_val: float, mode_name: str):
-        self._cancel_manual_automation("PREPARING", quiet=True)
-        self._manual_point_token += 1
-        current_token = self._manual_point_token
-        self._manual_target_amps = new_val
-        self._manual_save_done = False
-        self._manual_capture_done = False
-        self._manual_last_record = None
-        self._manual_mode_name = mode_name
+    @staticmethod
+    def _run_number(value: float) -> str:
+        return f"{float(value):g}".replace("-", "neg").replace(".", "p")
 
+    def _base_test_name(self) -> str:
         campaign = self.test_name.text().strip()
         if not campaign:
             campaign = f"Test_{datetime.now().strftime('%Y%m%d_%H%M')}"
             self.test_name.setText(campaign)
-        self._manual_run_id = new_run_id(campaign)
-        self._manual_point_id = point_id(self._manual_run_id, 0)
+        return campaign
+
+    def _manual_label(self, mode_name: str, amps: float | None = None) -> str:
+        base = self._manual_base_campaign or self._base_test_name()
+        if mode_name == "Set Current":
+            return f"{base}_SetCurrent_{self._run_number(amps or 0.0)}A"
+        currents = self._manual_recorded_currents
+        if currents:
+            return f"{base}_StepCurrent_{self._run_number(min(currents))}to{self._run_number(max(currents))}A"
+        return f"{base}_StepCurrent_session"
+
+    def _begin_manual_session(self, mode_name: str, amps: float):
+        self._manual_mode_name = mode_name
+        self._manual_base_campaign = self._base_test_name()
+        self._manual_recorded_currents = []
+        self._manual_any_invalid = False
+        self._manual_run_created = False
+        self._manual_point_index = -1
+        self._manual_run_label = self._manual_label(mode_name, amps)
+        self._manual_run_id = new_run_id(self._manual_run_label)
+        self._manual_store = self._store_for_source("Simulation" if self.simulation.isChecked() else "Hardware")
+        self._clear_live_run_view()
+
+    def _finalize_manual_session(self, reason: str = "Manual run closed", status_override: str | None = None):
+        run_id = self._manual_run_id
+        if run_id and self._manual_run_created and self._manual_store is not None:
+            final_label = self._manual_label(self._manual_mode_name, self._manual_target_amps)
+            status = status_override or ("Invalid" if self._manual_any_invalid else "Valid")
+            try:
+                self._manual_store.update_run_fields(run_id, {"CampaignName": final_label})
+                self._manual_store.finish_run(run_id, status, reason)
+                self._load_history()
+            except Exception as exc:
+                self.statusBar().showMessage(f"Run close could not be saved: {exc}", 8000)
+        self._manual_run_id = ""
+        self._manual_point_id = ""
+        self._manual_point_index = -1
+        self._manual_run_created = False
+        self._manual_run_label = ""
+        self._manual_base_campaign = ""
+        self._manual_recorded_currents = []
+        self._manual_any_invalid = False
+        self._manual_store = None
+
+    def _start_manual_point_sequence(self, new_val: float, mode_name: str, step_action: str = "ascending_measurement"):
+        self._cancel_manual_automation("PREPARING", quiet=True)
+        self._manual_point_token += 1
+        current_token = self._manual_point_token
+        self._manual_step_action = step_action
+        self._manual_target_amps = new_val
+        self._manual_save_done = False
+        self._manual_capture_done = False
+        self._manual_last_record = None
+        if not self._manual_run_id or self._manual_mode_name != mode_name or mode_name == "Set Current":
+            self._finalize_manual_session("New manual run started")
+            self._begin_manual_session(mode_name, new_val)
+        self._manual_mode_name = mode_name
+        self._manual_point_index += 1
+        self._manual_point_id = point_id(self._manual_run_id, self._manual_point_index)
 
         load = self.hub.instruments["load"]
         def cmd():
@@ -4969,6 +5199,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if current_token != self._manual_point_token:
                 return
             self.statusBar().showMessage(f"Load set to {new_val:g} A · ON")
+            if self._manual_save_done or self._manual_capture_done or getattr(self, "_manual_active_task", False):
+                return
+            if self._manual_step_action != "ascending_measurement" and self._manual_mode_name != "Set Current":
+                self._manual_point_completed()
+                return
             is_direct = (self.mode_group.checkedId() == 0)
             auto_save = self.direct_auto_save.isChecked() if is_direct else self.step_auto_save.isChecked()
             auto_cap = self.direct_auto_capture.isChecked() if is_direct else self.step_auto_capture.isChecked()
@@ -5005,6 +5240,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _manual_execute_next_auto_action(self):
         current_token = self._manual_point_token
+        if self._manual_step_action != "ascending_measurement" and self._manual_mode_name != "Set Current":
+            self._manual_point_completed()
+            return
         is_direct = (self.mode_group.checkedId() == 0)
         auto_save = self.direct_auto_save.isChecked() if is_direct else self.step_auto_save.isChecked()
         auto_cap = self.direct_auto_capture.isChecked() if is_direct else self.step_auto_capture.isChecked()
@@ -5041,19 +5279,24 @@ class MainWindow(QtWidgets.QMainWindow):
         run_rec = dict(settings["run_record"])
         run_rec["RunID"] = run_id
         run_rec["Mode"] = self._manual_mode_name
+        run_rec["CampaignName"] = self._manual_run_label or self._manual_label(self._manual_mode_name, self._manual_target_amps)
+        run_rec["ModulationLabel"] = self._manual_base_campaign or settings["modulation"]
+        store = self._store_for_source(settings["data_source"])
         amps = self._manual_target_amps if self._manual_target_amps > 0 else self.manual_current.value()
         pid = self._manual_point_id or point_id(run_id, 0)
         supersede = self._manual_save_done  # If already saved for this point instance, supersede!
 
         def task():
-            self.store.create_run(run_rec)
+            store.create_run(run_rec)
             pa = self.hub.instruments["pa"].read_snapshot()
-            load = self.hub.instruments["load"].read_snapshot()
+            load = self.hub.instruments["load"].read_snapshot(include_voltage=False)
             try:
                 psu = self.hub.instruments["psu"].read_snapshot(channels=[1, 2, 3])
             except Exception:
                 psu = None
-            derived, warnings = calculate_measurement(pa, load, psu, settings["supply_channels"], settings["dimensions"])
+            if token != self._manual_point_token:
+                return {}
+            derived, warnings = calculate_measurement(pa, load, psu, settings["supply_channels"])
             record = {
                 "PointID": pid,
                 "RunID": run_id,
@@ -5062,7 +5305,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "DataSource": settings["data_source"],
                 "Mode": self._manual_mode_name,
                 "VinTarget_V": settings["vin_target"],
-                "ModulationLabel": settings["modulation"],
+                "ModulationLabel": self._manual_base_campaign or settings["modulation"],
                 "Frequency_Hz": settings["frequency"],
                 "RequestedIout_A": amps,
                 **derived,
@@ -5071,19 +5314,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 "ScopeCaptureStatus": "Captured" if self._manual_capture_done else "Skipped",
             }
             dup_action = "supersede" if supersede else "keep"
-            self.store.append_measurement(record, duplicate_action=dup_action)
-            self.store.finish_run(run_id, "Valid" if derived else "Invalid")
+            store.append_measurement(record, duplicate_action=dup_action)
             return record
 
         def on_done(record: dict[str, Any]):
-            if token != self._manual_point_token:
+            if token != self._manual_point_token or not record:
                 self._manual_active_task = False
                 return
             self._manual_active_task = False
             self._manual_save_done = True
+            self._manual_run_created = True
             self._manual_last_record = record
+            if amps not in self._manual_recorded_currents:
+                self._manual_recorded_currents.append(amps)
+            self._manual_any_invalid = self._manual_any_invalid or record.get("Status") != "Valid"
             self._measurement_received(record)
-            self._load_history()
 
             is_direct = (self.mode_group.checkedId() == 0)
             auto_cap = self.direct_auto_capture.isChecked() if is_direct else self.step_auto_capture.isChecked()
@@ -5119,15 +5364,20 @@ class MainWindow(QtWidgets.QMainWindow):
         run_rec = dict(settings["run_record"])
         run_rec["RunID"] = run_id
         run_rec["Mode"] = self._manual_mode_name
+        run_rec["CampaignName"] = self._manual_run_label or self._manual_label(self._manual_mode_name, self._manual_target_amps)
+        run_rec["ModulationLabel"] = self._manual_base_campaign or settings["modulation"]
+        store = self._store_for_source(settings["data_source"])
         pid = self._manual_point_id or point_id(run_id, 0)
-        capture_dir = self.store.path.parent / "captures"
+        capture_dir = store.path.parent / "captures" / settings["data_source"].lower()
         capture_dir.mkdir(parents=True, exist_ok=True)
         png = capture_dir / f"{pid}.png"
         csv_f = capture_dir / f"{pid}.csv"
         amps = self._manual_target_amps if self._manual_target_amps > 0 else self.manual_current.value()
 
         def task():
-            self.store.create_run(run_rec)
+            if token != self._manual_point_token:
+                return {}
+            store.create_run(run_rec)
             status, error = "Captured", ""
             try:
                 self.hub.instruments["scope"].capture(png, csv_f)
@@ -5136,6 +5386,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 for artifact in (png, csv_f):
                     if artifact.exists():
                         artifact.unlink()
+            if token != self._manual_point_token:
+                for artifact in (png, csv_f):
+                    if artifact.exists():
+                        artifact.unlink()
+                return {}
             record = {
                 "PointID": pid,
                 "RunID": run_id,
@@ -5144,7 +5399,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "DataSource": settings["data_source"],
                 "Mode": self._manual_mode_name,
                 "VinTarget_V": settings["vin_target"],
-                "ModulationLabel": settings["modulation"],
+                "ModulationLabel": self._manual_base_campaign or settings["modulation"],
                 "Frequency_Hz": settings["frequency"],
                 "RequestedIout_A": amps,
                 "Quality": "Capture only" if not self._manual_save_done else "Valid",
@@ -5155,22 +5410,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 "ScopeCSV": str(csv_f) if status == "Captured" else "",
             }
             if not self._manual_save_done:
-                self.store.append_measurement(record)
+                store.append_measurement(record)
             else:
-                self.store.update_measurement_scope(
+                store.update_measurement_scope(
                     pid, status, error, str(png) if status == "Captured" else "", str(csv_f) if status == "Captured" else ""
                 )
-            self.store.finish_run(run_id, record["Status"], error)
             return record
 
         def on_done(record: dict[str, Any]):
-            if token != self._manual_point_token:
+            if token != self._manual_point_token or not record:
                 self._manual_active_task = False
                 return
             self._manual_active_task = False
             self._manual_capture_done = True
+            self._manual_run_created = True
+            if amps not in self._manual_recorded_currents:
+                self._manual_recorded_currents.append(amps)
+            self._manual_any_invalid = self._manual_any_invalid or record.get("Status") != "Valid"
             self.statusBar().showMessage(f"Scope capture {record.get('ScopeCaptureStatus', 'Done')}")
-            self._load_history()
 
             is_direct = (self.mode_group.checkedId() == 0)
             auto_save = self.direct_auto_save.isChecked() if is_direct else self.step_auto_save.isChecked()
@@ -5187,10 +5444,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _manual_point_completed(self):
         self._manual_active_task = False
         amps = self._manual_target_amps if self._manual_target_amps > 0 else self.manual_current.value()
-        if amps > 0:
+        if amps > 0 and (self._manual_step_action == "ascending_measurement" or self._manual_mode_name == "Set Current"):
             self._update_manual_status(f"✓ RECORDED · {amps:.2f} A", "recorded")
+        elif amps > 0:
+            self._update_manual_status(f"READY · {amps:.2f} A", "ready")
         else:
             self._update_manual_status("READY", "ready")
+        if self._manual_mode_name == "Set Current":
+            self._finalize_manual_session("Set current point completed")
         self.update_enabled_states()
 
     def _step_point_completed(self):
@@ -5211,25 +5472,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def _manual_save_override(self, mode_name: str = "Set Current"):
         if hasattr(self, "_manual_countdown_timer") and self._manual_countdown_timer.isActive():
             self._manual_countdown_timer.stop()
+        self._manual_step_action = "ascending_measurement"
         self._manual_mode_name = mode_name
         if not self._manual_run_id:
-            campaign = self.test_name.text().strip() or f"Test_{datetime.now().strftime('%Y%m%d_%H%M')}"
-            self.test_name.setText(campaign)
-            self._manual_run_id = new_run_id(campaign)
-            self._manual_point_id = point_id(self._manual_run_id, 0)
             self._manual_target_amps = self.manual_current.value()
+            self._begin_manual_session(mode_name, self._manual_target_amps)
+            self._manual_point_index = 0
+            self._manual_point_id = point_id(self._manual_run_id, self._manual_point_index)
         self._execute_manual_measurement(is_auto=False)
 
     def _manual_capture_override(self, mode_name: str = "Set Current"):
         if hasattr(self, "_manual_countdown_timer") and self._manual_countdown_timer.isActive():
             self._manual_countdown_timer.stop()
+        self._manual_step_action = "ascending_measurement"
         self._manual_mode_name = mode_name
         if not self._manual_run_id:
-            campaign = self.test_name.text().strip() or f"Test_{datetime.now().strftime('%Y%m%d_%H%M')}"
-            self.test_name.setText(campaign)
-            self._manual_run_id = new_run_id(campaign)
-            self._manual_point_id = point_id(self._manual_run_id, 0)
             self._manual_target_amps = self.manual_current.value()
+            self._begin_manual_session(mode_name, self._manual_target_amps)
+            self._manual_point_index = 0
+            self._manual_point_id = point_id(self._manual_run_id, self._manual_point_index)
         self._execute_manual_capture(is_auto=False)
 
     def _manual_measure(self):
@@ -5242,73 +5503,128 @@ class MainWindow(QtWidgets.QMainWindow):
         max_safe = self.manual_mode_max_current()
         amps = min(max_safe, max(0.0, self.manual_target_spin.value()))
         self.manual_target_spin.setValue(amps)
-        if not self._hardware_write_allowed() or not self._validate_current(amps):
-            return
-        self._manual_target_current = amps
-        if hasattr(self, "plot_progress_marker"):
-            self.plot_progress_marker.update_position(amps, 0.0, max_safe, active=(amps > 0.0))
-        load = self.hub.instruments["load"]
         if amps <= 0.0:
-            self._cancel_manual_automation("0.00 A · OFF")
+            self._manual_step_action = "zero_off"
+            self._cancel_manual_automation("READY")
+            self._finalize_manual_session("ZERO / OFF")
+            self._clear_live_run_view()
+            self._manual_target_current = 0.0
+            self.manual_target_spin.setValue(0.0)
+            if hasattr(self, "plot_progress_marker"):
+                self.plot_progress_marker.update_position(0.0, 0.0, max_safe, active=False)
             self.step_present_lbl.setText("0.00 A · OFF")
             self.step_present_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
+            self._manual_active_task = True
             def cmd():
+                load = self.hub.instruments["load"]
                 load.set_current(0.0)
                 load.set_input(False)
-            self._run_function(cmd, lambda _: self.statusBar().showMessage("Load set to 0.00 A · OFF"))
+            def on_done(_):
+                self._manual_active_task = False
+                self.statusBar().showMessage("Load set to 0.00 A · OFF")
+                self._update_manual_status("READY", "ready")
+                self.update_enabled_states()
+            self._run_function(cmd, on_done)
         else:
+            if not self.require_load_control_verified("Set Current") or not self._validate_current(amps, current_value=self._manual_target_current):
+                return
+            self._manual_target_current = amps
+            if hasattr(self, "plot_progress_marker"):
+                self.plot_progress_marker.update_position(amps, 0.0, max_safe, active=(amps > 0.0))
+            self._manual_step_action = "ascending_measurement"
             self.step_present_lbl.setText(f"{amps:.2f} A · ON")
             self.step_present_lbl.setStyleSheet(f"color: {BERKELEY_BLUE}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
-            self._start_manual_point_sequence(amps, "Set Current")
+            self._start_manual_point_sequence(amps, "Set Current", step_action="ascending_measurement")
 
     def _manual_direct_zero(self):
-        self._cancel_manual_automation("0.00 A · OFF")
+        self._manual_step_action = "zero_off"
+        self._cancel_manual_automation("READY")
+        self._finalize_manual_session("ZERO / OFF")
+        self._clear_live_run_view()
         self.manual_target_spin.setValue(0.0)
         self._manual_target_current = 0.0
         if hasattr(self, "plot_progress_marker"):
             self.plot_progress_marker.update_position(0.0, 0.0, self.manual_mode_max_current(), active=False)
         self.step_present_lbl.setText("0.00 A · OFF")
         self.step_present_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
-        if not self._hardware_write_allowed():
-            return
+        self._update_manual_status("READY", "ready")
+        self._manual_active_task = True
         load = self.hub.instruments["load"]
         def cmd():
             load.set_current(0.0)
             load.set_input(False)
-        self._run_function(cmd, lambda _: self.statusBar().showMessage("Load zeroed (0.00 A · OFF)"))
+        def on_done(_):
+            self._manual_active_task = False
+            self.statusBar().showMessage("Load zeroed (0.00 A · OFF)")
+            self._update_manual_status("READY", "ready")
+            self.update_enabled_states()
+        self._run_function(cmd, on_done)
 
     def _step_delta(self, direction: int):
         max_safe = self.manual_mode_max_current()
         if direction > 0:
             delta = self.manual_step_inc.value()
             new_val = min(max_safe, self._manual_target_current + delta)
+            if new_val == self._manual_target_current and new_val > 0:
+                self.statusBar().showMessage(f"Load already at maximum safe limit ({max_safe:g} A)", 4000)
+                return
+            if not self.require_load_control_verified("Step Current") or not self._validate_current(new_val, current_value=self._manual_target_current):
+                return
+            self._manual_step_action = "ascending_measurement"
+            self._manual_target_current = new_val
+            self.manual_target_spin.setValue(new_val)
+            if hasattr(self, "plot_progress_marker"):
+                self.plot_progress_marker.update_position(new_val, 0.0, max_safe, active=(new_val > 0.0))
+            self.step_present_lbl.setText(f"{new_val:.2f} A · ON")
+            self.step_present_lbl.setStyleSheet(f"color: {BERKELEY_BLUE}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
+            self._start_manual_point_sequence(new_val, "Step Current", step_action="ascending_measurement")
         else:
             delta = self.manual_step_dec.value()
             new_val = max(0.0, self._manual_target_current - delta)
+            self._manual_target_current = new_val
+            self.manual_target_spin.setValue(new_val)
+            if hasattr(self, "plot_progress_marker"):
+                self.plot_progress_marker.update_position(new_val, 0.0, max_safe, active=(new_val > 0.0))
 
-        self._manual_target_current = new_val
-        self.manual_target_spin.setValue(new_val)
-        if hasattr(self, "plot_progress_marker"):
-            self.plot_progress_marker.update_position(new_val, 0.0, max_safe, active=(new_val > 0.0))
-        load = self.hub.instruments["load"]
-        if new_val <= 0.0:
-            self._cancel_manual_automation("0.00 A · OFF")
-            self.step_present_lbl.setText("0.00 A · OFF")
-            self.step_present_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
-            if not self._hardware_write_allowed() or not self._validate_current(0.0):
+            load = self.hub.instruments["load"]
+            if new_val <= 0.0:
+                self._manual_step_action = "zero_off"
+                self._cancel_manual_automation("READY")
+                self._finalize_manual_session("ZERO / OFF")
+                self._clear_live_run_view()
+                self.step_present_lbl.setText("0.00 A · OFF")
+                self.step_present_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
+                self._update_manual_status("READY", "ready")
+                self._manual_active_task = True
+                def cmd_zero():
+                    load.set_current(0.0)
+                    load.set_input(False)
+                def on_zero_done(_):
+                    self._manual_active_task = False
+                    self.statusBar().showMessage("Load stepped to 0.00 A · OFF")
+                    self._update_manual_status("READY", "ready")
+                    self.update_enabled_states()
+                self._run_function(cmd_zero, on_zero_done)
                 return
-            def cmd():
-                load.set_current(0.0)
-                load.set_input(False)
-            self._run_function(cmd, lambda _: self.statusBar().showMessage("Load stepped to 0.00 A · OFF"))
-            return
 
-        self.step_present_lbl.setText(f"{new_val:.2f} A · ON")
-        self.step_present_lbl.setStyleSheet(f"color: {BERKELEY_BLUE}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
-        if not self._hardware_write_allowed() or not self._validate_current(new_val):
-            return
-
-        self._start_manual_point_sequence(new_val, "Step Current")
+            if not self.require_load_control_verified("Step Current") or not self._validate_current(new_val, current_value=self._manual_target_current):
+                return
+            self._manual_step_action = "descending_unload"
+            self._cancel_manual_automation(f"READY · {new_val:.2f} A", quiet=True)
+            self.step_present_lbl.setText(f"{new_val:.2f} A · ON")
+            self.step_present_lbl.setStyleSheet(f"color: {BERKELEY_BLUE}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
+            self._update_manual_status(f"RAMPING DOWN · {new_val:.2f} A", "settling")
+            self.update_enabled_states()
+            self._manual_active_task = True
+            def cmd_down():
+                load.set_current(new_val)
+                load.set_input(True)
+            def on_down_done(_):
+                self._manual_active_task = False
+                self.statusBar().showMessage(f"Load stepped down to {new_val:g} A · ON")
+                self._update_manual_status(f"READY · {new_val:.2f} A", "ready")
+                self.update_enabled_states()
+            self._run_function(cmd_down, on_down_done)
 
     def _manual_set(self):
         self._manual_direct_set()
@@ -5380,11 +5696,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.test_name.setText(campaign)
             self.statusBar().showMessage(f"Notice: Auto-generated Test Name '{campaign}'", 4000)
 
+        base_campaign = campaign
         mode_idx = self.mode_group.checkedId()
-        mode = "Manual" if (manual or mode_idx in (0, 1)) else ("Continuous" if mode_idx == 2 else "Pulse")
+        if manual:
+            mode = self._manual_mode_name
+        else:
+            mode = ["Set Current", "Step Current", "Continuous", "Pulse"][mode_idx]
         cap = self.cap_val
 
-        if mode == "Manual":
+        if mode in ("Set Current", "Step Current"):
             points = [self.manual_current.value()]
             capture_points = set()
             settle, dwell, s_win, s_cnt, cooldown, psu_req = 3.0, 3.0, 0.5, 1, 3.0, False
@@ -5412,6 +5732,22 @@ class MainWindow(QtWidgets.QMainWindow):
             if s_win > dwell:
                 raise ValueError("Pulse measurement window cannot exceed dwell time")
 
+        if mode == "Set Current":
+            campaign = f"{base_campaign}_SetCurrent_{self._run_number(self._manual_target_amps or self.manual_current.value())}A"
+        elif mode == "Step Current":
+            campaign = self._manual_run_label or f"{base_campaign}_StepCurrent_session"
+        elif mode == "Continuous":
+            campaign = (
+                f"{base_campaign}_Continuous_{self._run_number(self.cont_start.value())}to"
+                f"{self._run_number(self.cont_stop.value())}A_step{self._run_number(self.cont_step.value())}A"
+            )
+        else:
+            campaign = (
+                f"{base_campaign}_Pulse_{self._run_number(self.pulse_start.value())}to"
+                f"{self._run_number(self.pulse_stop.value())}A_step{self._run_number(self.pulse_step.value())}A_"
+                f"on{self._run_number(self.pulse_dwell.value())}s_rest{self._run_number(self.pulse_cooldown.value())}s"
+            )
+
         run_id = new_run_id(campaign)
         fpga_status, fpga_data, fpga_warning = (fpga_snapshot(Path(self.config["fpga_root"]), self.frequency.value()) if self.fpga_check.isChecked() else ("Unavailable", {}, "Skipped by operator"))
         data_source = "Simulation" if self.simulation.isChecked() else "Hardware"
@@ -5424,11 +5760,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_record = {
             "RunID": run_id, "CampaignName": campaign, "Created": utc_now(), "Status": "Aborted", "DataSource": data_source, "Mode": mode,
-            "VinTarget_V": self.vin_target.value(), "ModulationLabel": campaign, "Frequency_Hz": self.frequency.value(),
+            "VinTarget_V": self.vin_target.value(), "ModulationLabel": base_campaign, "Frequency_Hz": self.frequency.value(),
             "ModulationMetadata": "",
             "AuxA_Included": aux_a_inc, "AuxB_Included": aux_b_inc, "AuxC_Included": aux_c_inc,
             "SupplyConfiguration": supply_json,
-            "Length_mm": 24.0, "Width_mm": 16.0, "Height_mm": 3.4,
             "WorkingCap_A": cap, "Notes": self.notes.text(), "InstrumentIdentities": identities,
             "FPGASnapshotStatus": fpga_status, "FPGASnapshot": fpga_data, "Warnings": fpga_warning,
         }
@@ -5437,17 +5772,30 @@ class MainWindow(QtWidgets.QMainWindow):
             "run_id": run_id, "run_record": run_record, "points": points, "capture_points": capture_points,
             "mode": mode, "settle": settle, "dwell": dwell, "sample_window": s_win, "sample_count": s_cnt,
             "cooldown": cooldown, "working_cap": cap, "vin_target": self.vin_target.value(),
-            "modulation": campaign, "frequency": self.frequency.value(),
-            "dimensions": (24.0, 16.0, 3.4), "supply_channels": channels, "psu_required": psu_req,
+            "modulation": base_campaign, "frequency": self.frequency.value(),
+            "supply_channels": channels, "psu_required": psu_req,
             "data_source": data_source, "duplicate_action": "keep",
             "return_to_zero_step": return_step,
         }
 
     def start_run(self):
         if self.worker and self.worker.isRunning(): return
-        if not self._hardware_write_allowed(): return
+        mode_idx = self.mode_group.checkedId() if hasattr(self, "mode_group") else 2
+        action_name = "Pulse Sweep" if mode_idx == 3 else "Continuous Sweep"
+        if not self.require_load_control_verified(action_name): return
         try: settings = self._collect_settings()
         except Exception as exc: QtWidgets.QMessageBox.warning(self, "Run preflight", str(exc)); return
+        run_store = self._store_for_source(settings["data_source"])
+
+        try:
+            run_store.preflight(require_live_commit=True)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Run not started · Workbook unavailable",
+                f"The campaign workbook could not accept a validated save. No sweep or load command was started.\n\n{exc}",
+            )
+            return
 
         # Validate scope capture points against requested sweep points
         if settings.get("capture_points"):
@@ -5480,8 +5828,8 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Vin preflight failed", str(exc)); return
 
-        condition = {"DataSource": settings["data_source"], "VinTarget_V": settings["vin_target"], "ModulationLabel": settings["modulation"], "Frequency_Hz": settings["frequency"]}
-        duplicates = self.store.find_duplicates(condition, settings["points"])
+        condition = {"DataSource": settings["data_source"], "Mode": settings["mode"], "VinTarget_V": settings["vin_target"], "ModulationLabel": settings["modulation"], "Frequency_Hz": settings["frequency"]}
+        duplicates = run_store.find_duplicates(condition, settings["points"])
         if duplicates:
             box = QtWidgets.QMessageBox(self); box.setWindowTitle("Duplicate points"); box.setText("Existing measurements match: " + ", ".join(f"{item['current']:g} A" for item in duplicates)); supersede = box.addButton("Replace / Supersede", QtWidgets.QMessageBox.ButtonRole.AcceptRole); keep = box.addButton("Keep both", QtWidgets.QMessageBox.ButtonRole.ActionRole); cancel = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel); box.exec()
             if box.clickedButton() == cancel: return
@@ -5492,7 +5840,7 @@ class MainWindow(QtWidgets.QMainWindow):
             phrase, ok = QtWidgets.QInputDialog.getText(self, "Large sweep command", f"Points contain a current ≥ 100 A or step jump ≥ 50 A. Type RUN MAX {max(settings['points']):g} A")
             if not ok or phrase.strip() != f"RUN MAX {max(settings['points']):g} A": return
 
-        summary = f"Test: {self.test_name.text()}\nMode: {settings['mode']}\nVin: {settings['vin_target']:g} V\nPoints: {', '.join(f'{x:g}' for x in settings['points'])} A\nCap: {settings['working_cap']:g} A\n\nConfirm to execute sweep."
+        summary = f"Test: {settings['run_record']['CampaignName']}\nMode: {settings['mode']}\nVin: {settings['vin_target']:g} V\nPoints: {', '.join(f'{x:g}' for x in settings['points'])} A\nCap: {settings['working_cap']:g} A\n\nConfirm to execute sweep."
         if QtWidgets.QMessageBox.question(self, "Confirm sweep execution", summary) != QtWidgets.QMessageBox.StandardButton.Yes: return
 
         self.config["campaign_name"] = self.test_name.text()
@@ -5501,7 +5849,7 @@ class MainWindow(QtWidgets.QMainWindow):
         save_config(self.config)
 
         self.run_strip.setVisible(True)
-        self.worker = SweepWorker(self.hub, self.store, settings)
+        self.worker = SweepWorker(self.hub, run_store, settings)
         self.worker.progress.connect(self._run_progress)
         self.worker.ramp_progress.connect(self._ramp_progress_received)
         self.worker.state_changed.connect(self._state_changed)
@@ -5621,8 +5969,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.kpi_labels["Iout"].setText(f"{iout_val:.2f} A · ON" if iout_val > 0.001 else "0.00 A · OFF")
             if hasattr(self, "live_act_lbl"):
                 self.live_act_lbl.setText(f"Actual: {iout_val:.2f} A")
-        if self.store.last_warning:
-            self.statusBar().showMessage(self.store.last_warning)
+        record_store = self._store_for_source(record.get("DataSource", "Hardware"))
+        if record_store.last_warning:
+            self.statusBar().showMessage(record_store.last_warning)
 
     def _run_completed(self, status: str, warning: str):
         disp_status = "COMPLETED" if status == "Valid" else ("STOPPED" if status == "Stopped" else "ABORTED")
@@ -5652,7 +6001,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_curve.setData([], [])
         self.tabs.setCurrentIndex(1)  # Switch to Run tab
         self.run_strip.setVisible(True)
-        self.strip_label.setText("SIMULATION DEMO: Demo SID profile")
+        self.strip_label.setText("SIMULATION DEMO: Generic converter profile")
         self.strip_label.setStyleSheet(f"color: {WARNING_AMBER}; font-weight: 700;")
 
         self.demo_timer = QtCore.QTimer(self)
@@ -5679,7 +6028,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rec = {
             "PointID": f"DEMO-P{self.demo_index:03d}", "RunID": "DEMO-RUN", "Timestamp": utc_now(),
             "Status": "Valid", "DataSource": "Simulation", "Mode": "Continuous", "VinTarget_V": 48.0,
-            "ModulationLabel": "Demo SID profile", "Frequency_Hz": 100000.0, "RequestedIout_A": amps,
+            "ModulationLabel": "Generic converter demo", "Frequency_Hz": 100000.0, "RequestedIout_A": amps,
             "Iout_A": amps, "Vin_V": vin, "Vout_V": vout, "Iin_A": pin / vin, "PinConverter_W": pin,
             "Pout_W": vout * amps, "Paux_W": 0.15, "LossConverter_W": loss, "LossSystem_W": loss + 0.15,
             "EfficiencyConverter_pct": eff, "EfficiencySystem_pct": eff * 0.995,
@@ -5708,7 +6057,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_history(self):
         try:
-            runs = self.store.list_runs()
+            stores = []
+            if getattr(self, "store", None) is not None:
+                stores.append(self.store)
+            if hasattr(self, "hardware_store") and self.hardware_store not in stores:
+                stores.append(self.hardware_store)
+            if hasattr(self, "simulation_store") and self.simulation_store not in stores:
+                stores.append(self.simulation_store)
+            runs = []
+            seen_ids = set()
+            for s in stores:
+                if s is None: continue
+                try:
+                    for r in s.list_runs():
+                        rid = r.get("RunID")
+                        if rid and rid not in seen_ids:
+                            seen_ids.add(rid)
+                            runs.append(r)
+                except Exception:
+                    pass
+            runs.sort(key=lambda item: str(item.get("Created") or ""))
         except Exception as exc:
             self.statusBar().showMessage(str(exc))
             return
@@ -5729,6 +6097,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ("VinTarget_V", str(run.get("VinTarget_V", ""))),
                 ("Frequency_Hz", str(run.get("Frequency_Hz", ""))),
                 ("ModulationLabel", str(run.get("ModulationLabel", ""))),
+                ("Mode", str(run.get("Mode", ""))),
             )
             for c_idx, (_, val) in enumerate(cols, start=1):
                 self.history_table.setItem(row, c_idx, QtWidgets.QTableWidgetItem(val))
@@ -5742,6 +6111,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Collect unique full RunIDs and short IDs
         selected_run_ids: list[str] = []
         short_id_map: dict[str, str] = {}
+        store_map: dict[str, WorkbookStore] = {}
         for row in selected_rows:
             short_id = self.history_table.item(row, 0).text() if self.history_table.item(row, 0) else ""
             run_id = self.history_table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole)
@@ -5751,13 +6121,29 @@ class MainWindow(QtWidgets.QMainWindow):
             if run_id and run_id not in selected_run_ids:
                 selected_run_ids.append(run_id)
                 short_id_map[run_id] = short_id or (run_id.split("-")[-1] if "-" in run_id else run_id)
+                store_map[run_id] = self._store_for_history_row(row)
 
         if not selected_run_ids:
             QtWidgets.QMessageBox.warning(self, "Delete Runs", "Could not identify RunID for selected rows.")
             return
 
         try:
-            runs = self.store.list_runs()
+            stores = []
+            if getattr(self, "store", None) is not None:
+                stores.append(self.store)
+            if hasattr(self, "hardware_store") and self.hardware_store not in stores:
+                stores.append(self.hardware_store)
+            if hasattr(self, "simulation_store") and self.simulation_store not in stores:
+                stores.append(self.simulation_store)
+            runs = []
+            seen_ids = set()
+            for s in stores:
+                if s is None: continue
+                for r in s.list_runs():
+                    rid = r.get("RunID")
+                    if rid and rid not in seen_ids:
+                        seen_ids.add(rid)
+                        runs.append(r)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Delete Runs", f"Error reading workbook: {exc}")
             return
@@ -5778,7 +6164,7 @@ class MainWindow(QtWidgets.QMainWindow):
             dialog = DeleteRunDialog(run_rec, self)
             if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
                 try:
-                    self.store.delete_run(selected_run_ids[0])
+                    store_map[selected_run_ids[0]].delete_run(selected_run_ids[0])
                 except Exception as del_err:
                     QtWidgets.QMessageBox.critical(self, "Delete Run Error", str(del_err))
                     self._load_history()
@@ -5793,7 +6179,11 @@ class MainWindow(QtWidgets.QMainWindow):
             dialog = DeleteBatchRunsDialog(matching_runs, self)
             if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
                 try:
-                    self.store.delete_runs(selected_run_ids)
+                    grouped: dict[WorkbookStore, list[str]] = {}
+                    for rid in selected_run_ids:
+                        grouped.setdefault(store_map[rid], []).append(rid)
+                    for store, run_ids in grouped.items():
+                        store.delete_runs(run_ids)
                 except Exception as del_err:
                     QtWidgets.QMessageBox.critical(self, "Delete Runs Error", str(del_err))
                     self._load_history()
@@ -5819,6 +6209,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.wait(5000)
         QtCore.QThreadPool.globalInstance().waitForDone(1000)
         QtWidgets.QApplication.processEvents()
+        self._finalize_manual_session("Application closed", status_override="Stopped")
         self.hub.safe_shutdown()
         save_config(self.config)
         event.accept()

@@ -13,7 +13,7 @@ python sid_bench_gui.py
 
 Edit the copied `bench_config.json` for this bench's VISA resources and optional FPGA checkout. The local configuration is intentionally ignored by Git so operator settings, hardware serials, and machine-specific paths are not published.
 
-Use **Simulation Mode** for a complete dummy sweep before connecting hardware. Simulation writes the real workbook schema and clearly labels every row `DataSource = Simulation`.
+Use **Simulation Mode** for a complete dummy sweep before connecting hardware. Simulation writes the same schema to its own workbook and clearly labels every row `DataSource = Simulation`; it never mixes with measured hardware data.
 
 For passive real-device discovery:
 
@@ -47,7 +47,7 @@ The compact Bench cards embed resized product-identification thumbnails sourced 
 - `bench_config.example.json` — safe starting template for local configuration.
 - `bench_config.json` — generated/local addresses, working cap, and last-used operator settings; intentionally not committed.
 
-Results append to `results/SID_APEC_extension.xlsx`. Scope artifacts share `results/captures/`; the workbook keeps their exact paths and capture status. One `.bak` workbook is retained during atomic saves.
+Measured results append to `results/hardware_measurements.xlsx`; demo and simulation runs append to `results/simulation_runs.xlsx`. History combines both sources in the GUI while each workbook remains independent. Scope artifacts share `results/captures/`; each workbook keeps exact paths and capture status. One validated `.bak` per workbook is retained during atomic saves. If Excel or cloud sync temporarily locks a live workbook, one durable local pending state preserves all updates and is retried on the next save; the application does not create per-point fallback workbooks.
 
 The entire `results/` tree is intentionally ignored by Git. This prevents large scope CSV files, screenshots, workbook backups, and measured data from inflating repository history. Back up valuable campaign data separately; Git will not store or recover it.
 
