@@ -20,11 +20,14 @@ def clean_qt_state(tmp_path, monkeypatch):
     # No GUI test may ever touch the operator's configured campaign workbook.
     monkeypatch.setenv("KICKSTART_WORKBOOK_PATH", str(tmp_path / "pytest_campaign.xlsx"))
     config_file = Path(__file__).resolve().parent / "bench_config.json"
-    orig_config = config_file.read_text(encoding="utf-8") if config_file.exists() else None
     yield
-    if orig_config is not None and config_file.exists():
+    if config_file.exists():
         try:
-            config_file.write_text(orig_config, encoding="utf-8")
+            import json
+            data = json.loads(config_file.read_text(encoding="utf-8"))
+            if data.get("working_current_cap_a") != 60.0:
+                data["working_current_cap_a"] = 60.0
+                config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             pass
     try:
@@ -86,6 +89,8 @@ def test_simulation_and_hardware_use_separate_workbooks_and_combined_history(tmp
     window.history_table.selectRow(sim_row)
     window._history_selection_changed()
     assert len(window.comp_plot_widget.listDataItems()) == 2
+    assert window.comp_metric_combo.itemText(0) == "Efficiency (%)"
+    assert window.comp_metric_combo.minimumWidth() >= 130
     assert window.comp_metric_combo.itemText(1) == "Loss (W)"
     assert window.comp_metric_combo.itemText(2) == "Power (W)"
     assert window.comp_legend.offset == (-12, -12)
@@ -914,6 +919,7 @@ def test_live_plot_ranges_and_negative_current_prevention():
     ]
     window._switch_live_plot(0) # Efficiency
     assert window.live_metric_combo.itemText(0) == "Efficiency (%)"
+    assert window.live_metric_combo.minimumWidth() >= 130
     assert list(window.live_curve.getData()[1]) == [0.0, 102.5]
     assert list(window.live_system_curve.getData()[1]) == [99.0]
     # X min is 0.0, never negative
@@ -1747,6 +1753,8 @@ def test_chroma_safety_limit_card_and_bench_configuration():
     # Restore default 60 A limit
     window.load_card.cap_spin.setValue(60.0)
     window.load_card.apply_cap_btn.click()
+    window.cont_stop.setValue(60.0)
+    window.pulse_stop.setValue(60.0)
     assert window.cap_val == 60.0
 
     window.close()

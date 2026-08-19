@@ -4405,6 +4405,7 @@ class MainWindow(QtWidgets.QMainWindow):
         p_top = QtWidgets.QHBoxLayout()
         p_top.setSpacing(8)
         self.live_metric_combo = QtWidgets.QComboBox()
+        self.live_metric_combo.setMinimumWidth(130)
         self.live_metric_combo.addItems([
             "Efficiency (%)",
             "Loss (W)",
@@ -4774,6 +4775,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top_sel = QtWidgets.QHBoxLayout()
         top_sel.addWidget(QtWidgets.QLabel("<b>Comparison Metric:</b>"))
         self.comp_metric_combo = QtWidgets.QComboBox()
+        self.comp_metric_combo.setMinimumWidth(130)
         self.comp_metric_combo.addItems([
             "Efficiency (%)",
             "Loss (W)",
