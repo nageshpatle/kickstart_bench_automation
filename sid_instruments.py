@@ -335,8 +335,14 @@ class Chroma63206A(VisaInstrument):
             dev.write("LOAD ON" if enabled else "LOAD OFF")
 
     def safe_off(self) -> None:
+        # De-energize first, then clear the programmed setpoint so an accidental
+        # later LOAD ON cannot resume at the previous high-current command.
         try:
             self.set_input(False)
+        except Exception:
+            pass
+        try:
+            self.set_current(0.0)
         except Exception:
             pass
 
@@ -649,6 +655,7 @@ class SimLoad(SimInstrument):
 
     def safe_off(self) -> None:
         self.env.load_enabled = False
+        self.env.current_set = 0.0
 
 
 class SimPA(SimInstrument):

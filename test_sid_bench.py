@@ -8,7 +8,10 @@ import time
 import pytest
 from openpyxl import load_workbook
 
-from sid_bench_gui import MEAS_HEADERS, RUN_HEADERS, SweepWorker, WorkbookStore, calculate_measurement, parse_points
+from sid_bench_gui import (
+    MEAS_HEADERS, RUN_HEADERS, SweepWorker, WorkbookStore, calculate_measurement,
+    capture_root_for_source, efficiency_axis_bounds, parse_points,
+)
 from sid_instruments import InstrumentHub, InstrumentSnapshot, SupplyChannel, VisaInstrument
 
 
@@ -38,20 +41,70 @@ def run_record(run_id: str, source: str = "Simulation") -> dict:
     return record
 
 
-def test_simulation_and_hardware_use_separate_workbooks_and_combined_history():
+def test_simulation_and_hardware_use_separate_workbooks_and_combined_history(tmp_path: Path):
     import os
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
-    from PyQt6 import QtWidgets
-    from sid_bench_gui import MainWindow
+    from PyQt6 import QtCore, QtWidgets
+    from sid_bench_gui import MainWindow, WorkbookStore
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
     window = MainWindow()
+    window.hardware_store = WorkbookStore(tmp_path / "hw.xlsx")
+    window.simulation_store = WorkbookStore(tmp_path / "sim.xlsx")
+    window.store = window.hardware_store
     assert window.hardware_store.path != window.simulation_store.path
     window.hardware_store.create_run({**run_record("HW-RUN", "Hardware"), "CampaignName": "Measured"})
     window.simulation_store.create_run({**run_record("SIM-RUN", "Simulation"), "CampaignName": "Demo"})
+    measurement = {name: "" for name in MEAS_HEADERS}
+    window.simulation_store.append_measurement({
+        **measurement, "PointID": "SIM-P1", "RunID": "SIM-RUN", "Status": "Valid",
+        "DataSource": "Simulation", "Iout_A": 2.0,
+        "EfficiencyConverter_pct": 97.8, "EfficiencySystem_pct": 96.9,
+        "LossConverter_W": 2.1, "LossSystem_W": 2.7,
+        "PinConverter_W": 100.0, "Pout_W": 97.9, "Paux_W": 0.6,
+    })
+    window.hardware_store.append_measurement({
+        **measurement, "PointID": "HW-P1", "RunID": "HW-RUN", "Status": "Valid",
+        "DataSource": "Hardware", "Iout_A": 2.0,
+        "EfficiencyConverter_pct": 97.5, "EfficiencySystem_pct": 96.5,
+        "LossConverter_W": 2.2, "LossSystem_W": 2.9,
+        "PinConverter_W": 101.0, "Pout_W": 98.8, "Paux_W": 0.7,
+    })
     window._load_history()
     sources = {window.history_table.item(row, 4).text() for row in range(window.history_table.rowCount())}
     assert sources == {"Hardware", "Simulation"}
+    sim_row = next(row for row in range(window.history_table.rowCount()) if window.history_table.item(row, 4).text() == "Simulation")
+    hw_row = next(row for row in range(window.history_table.rowCount()) if window.history_table.item(row, 4).text() == "Hardware")
+    assert window._store_for_history_row(sim_row) is window.simulation_store
+    assert window._store_for_history_row(hw_row) is window.hardware_store
+    window.history_table.selectRow(sim_row)
+    window._history_selection_changed()
+    assert len(window.comp_plot_widget.listDataItems()) == 2
+    assert window.comp_metric_combo.itemText(1) == "Loss (W)"
+    assert window.comp_metric_combo.itemText(2) == "Power (W)"
+    assert window.comp_legend.offset == (-12, -12)
+    assert vars(window.comp_legend)["_GraphicsWidgetAnchor__parentAnchor"] == (1, 1)
+    for metric_index, expected_count in ((0, 2), (1, 2), (2, 3)):
+        window.comp_metric_combo.setCurrentIndex(metric_index)
+        window._history_selection_changed()
+        items = window.comp_plot_widget.listDataItems()
+        assert len(items) == expected_count
+        expected_colors = ["#002676", "#d97706", "#0f766e"][:expected_count]
+        assert [item.opts["pen"].color().name() for item in items] == expected_colors
+        assert all(item.opts["pen"].style() == QtCore.Qt.PenStyle.SolidLine for item in items)
+
+    # Multi-run overlays retain metric color families and use marker identity for runs.
+    window.history_table.selectAll()
+    window.comp_metric_combo.setCurrentIndex(2)
+    window._history_selection_changed()
+    items = window.comp_plot_widget.listDataItems()
+    assert len(items) == 6
+    assert [item.opts["symbol"] for item in items[:3]] == [items[0].opts["symbol"]] * 3
+    assert [item.opts["symbol"] for item in items[3:]] == [items[3].opts["symbol"]] * 3
+    assert items[0].opts["symbol"] != items[3].opts["symbol"]
+    assert items[0].opts["pen"].color().hue() == items[3].opts["pen"].color().hue()
+    assert items[1].opts["pen"].color().hue() == items[4].opts["pen"].color().hue()
+    assert items[2].opts["pen"].color().hue() == items[5].opts["pen"].color().hue()
     window.close()
 
 
@@ -108,6 +161,43 @@ def test_full_run_names_include_mode_and_minimal_parameters():
     window.close()
 
 
+def test_switching_frequency_is_shown_in_khz_and_stored_in_hz():
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets
+    from sid_bench_gui import MainWindow
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
+    window = MainWindow()
+    assert window.frequency.suffix() == " kHz"
+    assert window.frequency.value() == pytest.approx(float(window.config["frequency_hz"]) / 1000.0)
+    window.frequency.setValue(200.0)
+    assert window.frequency.text() == "200 kHz"
+    settings = window._collect_settings(manual=True)
+    assert settings["frequency"] == 200000.0
+    assert settings["run_record"]["Frequency_Hz"] == 200000.0
+    window.close()
+
+
+def test_manual_action_error_releases_busy_controls():
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets
+    from sid_bench_gui import MainWindow
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
+    window = MainWindow()
+    window.simulation.setChecked(True)
+    window.btn_mode_direct.click()
+    window.point_action_busy = True
+    window._manual_active_task = True
+    window.update_enabled_states()
+    assert not window.btn_direct_set.isEnabled()
+    assert window.btn_direct_zero.isEnabled()
+    window._manual_action_failed("simulated save failure", window._manual_point_token)
+    assert window.btn_direct_set.isEnabled()
+    assert window.btn_direct_zero.isEnabled()
+    window.close()
+
+
 
 def test_parse_points_supports_ranges_and_values():
     assert parse_points("0:6:2, 9.5") == [0.0, 2.0, 4.0, 6.0, 9.5]
@@ -152,6 +242,15 @@ def test_calculation_preserves_signed_validity_and_auxiliary_power():
     assert result["LossConverter_W"] == pytest.approx(480.0 - 456.0) # 24.0 W
     assert result["LossSystem_W"] == pytest.approx(24.0 + 1.2)       # 25.2 W
     assert result["EfficiencyConverter_pct"] == 95.0
+
+
+def test_system_efficiency_is_missing_without_aux_supply_data():
+    pa = InstrumentSnapshot("pa", {"vin": 48.0, "iin": 2.0, "vout": 12.0})
+    load = InstrumentSnapshot("load", {"current": 7.5, "voltage": 12.0})
+    result, warnings = calculate_measurement(pa, load, None, [])
+    assert any("auxiliary loss is incomplete" in warning for warning in warnings)
+    assert result["EfficiencyConverter_pct"] == pytest.approx(93.75)
+    assert result["EfficiencySystem_pct"] is None
 
 
 
@@ -802,9 +901,15 @@ def test_live_plot_ranges_and_negative_current_prevention():
     
     # Simulate measurements with high efficiency > 100%
     window.plot_rows = [
-        {"Iout_A": 10.0, "EfficiencyConverter_pct": 102.5, "LossSystem_W": -1.0, "Pout_W": 120.0}
+        {"Status": "Valid", "Iout_A": 0.0, "EfficiencyConverter_pct": 0.0, "EfficiencySystem_pct": None},
+        {"Status": "Valid", "Iout_A": 10.0, "EfficiencyConverter_pct": 102.5,
+         "EfficiencySystem_pct": 99.0, "LossConverter_W": -1.5, "LossSystem_W": -1.0,
+         "PinConverter_W": 125.0, "Pout_W": 120.0, "Paux_W": 0.7},
     ]
     window._switch_live_plot(0) # Efficiency
+    assert window.live_metric_combo.itemText(0) == "Efficiency (%)"
+    assert list(window.live_curve.getData()[1]) == [0.0, 102.5]
+    assert list(window.live_system_curve.getData()[1]) == [99.0]
     # X min is 0.0, never negative
     x_range = window.live_plot_widget.getPlotItem().getViewBox().viewRange()[0]
     assert x_range[0] <= 0.01
@@ -812,7 +917,26 @@ def test_live_plot_ranges_and_negative_current_prevention():
     # Y range accommodates > 100% with margin
     y_range = window.live_plot_widget.getPlotItem().getViewBox().viewRange()[1]
     assert y_range[1] >= 102.5
+    assert window.live_metric_combo.itemText(1) == "Loss (W)"
+    assert window.live_metric_combo.itemText(2) == "Power (W)"
+    assert window.live_legend.offset == (-12, -12)
+    assert vars(window.live_legend)["_GraphicsWidgetAnchor__parentAnchor"] == (1, 1)
+    window._switch_live_plot(1)
+    assert list(window.live_curve.getData()[1]) == [-1.5]
+    assert list(window.live_system_curve.getData()[1]) == [-1.0]
+    window._switch_live_plot(2)
+    assert list(window.live_curve.getData()[1]) == [125.0]
+    assert list(window.live_system_curve.getData()[1]) == [120.0]
+    assert list(window.live_aux_curve.getData()[1]) == [0.7]
     window.close()
+
+
+def test_efficiency_axis_rounding_and_capture_source_folders(tmp_path: Path):
+    assert efficiency_axis_bounds([93.6, 96.1, 97.0]) == (90.0, 100.0)
+    assert efficiency_axis_bounds([95.0, 100.0]) == (90.0, 105.0)
+    workbook = tmp_path / "results" / "hardware_campaign.xlsx"
+    assert capture_root_for_source(workbook, "Hardware") == tmp_path / "results" / "captures" / "hardware"
+    assert capture_root_for_source(workbook, "Simulation") == tmp_path / "results" / "captures" / "simulation"
 
 
 def test_plot_compact_live_status_and_sweep_progress_tracker():
@@ -897,7 +1021,10 @@ def test_default_sweep_ranges_and_buttonless_cap():
     assert window.cont_start.value() == 0.0
     assert window.cont_stop.value() == 60.0
     assert window.cont_step.value() == 2.0
-    assert window.cont_settle.value() == 3.0
+    assert window.cont_settle.value() == 5.0
+    assert window.cont_sample_window.value() == 3.0
+    assert window.direct_auto_delay.value() == 4.0
+    assert window.step_auto_delay.value() == 4.0
     assert "0 → 60 A" in window.cont_summary_lbl.text()
     assert "31 points" in window.cont_summary_lbl.text()
     assert window.cont_adv.isCheckable()
@@ -911,8 +1038,9 @@ def test_default_sweep_ranges_and_buttonless_cap():
     assert window.pulse_start.value() == 0.0
     assert window.pulse_stop.value() == 60.0
     assert window.pulse_step.value() == 2.0
-    assert window.pulse_dwell.value() == 3.0
-    assert window.pulse_cooldown.value() == 3.0
+    assert window.pulse_dwell.value() == 5.0
+    assert window.pulse_cooldown.value() == 5.0
+    assert window.pulse_sample_window.value() == 3.0
     assert "0 → 60 A" in window.pulse_summary_lbl.text()
     assert "31 pulses" in window.pulse_summary_lbl.text()
     assert window.pulse_adv.isCheckable()
@@ -931,7 +1059,9 @@ def test_default_sweep_ranges_and_buttonless_cap():
     assert window.tabs.tabText(0) == "Bench Setup"
     assert window.tabs.tabText(1) == "Run"
     assert window.tabs.tabText(2) == "History"
-    assert window.tabs.tabText(3) == "Help"
+    # Restore default 60 A limit
+    window.load_card.cap_spin.setValue(60.0)
+    window.load_card.apply_cap_btn.click()
     window.close()
 
 
@@ -1306,8 +1436,11 @@ def test_kpi_header_breathing_layout_and_prominent_values():
 
     window = MainWindow()
     
-    # 1. Assert all 5 KPIs exist (Vin, Iin, Vout, Iout, Eff)
-    assert set(window.kpi_labels.keys()) == {"Vin", "Iin", "Vout", "Iout", "Eff"}
+    # 1. Direct and derived KPIs share the single-row header.
+    assert set(window.kpi_labels.keys()) == {"Vin", "Iin", "Vout", "Iout", "Pin", "Pout", "Eff"}
+    assert window.kpi_labels["Pin"].text() == "—"
+    assert window.kpi_labels["Pout"].text() == "—"
+    assert window.kpi_labels["Eff"].text() == "—"
 
     # 2. Check prominent styling on value label
     vin_lbl = window.kpi_labels["Vin"]
@@ -1329,6 +1462,26 @@ def test_kpi_header_breathing_layout_and_prominent_values():
     assert window.kpi_labels["Vin"].text() == "48.02 V"
     assert window.kpi_labels["Iin"].text() == "2.500 A"
     assert window.kpi_labels["Vout"].text() == "12.01 V"
+    assert window.kpi_labels["Pin"].text() == "—"
+
+    # Derived values update together only from one valid calculated point.
+    window._measurement_received({
+        "Status": "Valid", "Iout_A": 4.99, "PinConverter_W": 29.69,
+        "Pout_W": 28.99, "EfficiencyConverter_pct": 97.68,
+    })
+    assert window.kpi_labels["Pin"].text() == "29.69 W"
+    assert window.kpi_labels["Pout"].text() == "28.99 W"
+    assert window.kpi_labels["Eff"].text() == "97.68%"
+    assert "#B45309" in window.kpi_labels["Pin"].styleSheet()
+
+    # A failed/invalid later point preserves the last successful trio.
+    window._measurement_received({
+        "Status": "Invalid", "PinConverter_W": 1.0, "Pout_W": 1.0,
+        "EfficiencyConverter_pct": 1.0,
+    })
+    assert window.kpi_labels["Pin"].text() == "29.69 W"
+    assert window.kpi_labels["Pout"].text() == "28.99 W"
+    assert window.kpi_labels["Eff"].text() == "97.68%"
 
     window.close()
 
@@ -1465,9 +1618,9 @@ def test_measurement_sampling_and_scope_capture_currents():
     assert window.cont_sample_count.value() == 1
     assert window.pulse_sample_count.value() == 1
 
-    # 2. Verify Measure Last defaults to 1.5 s and is enabled for active mode
-    assert window.cont_sample_window.value() == 1.5
-    assert window.pulse_sample_window.value() == 1.5
+    # 2. Measure Last defaults to 3 s inside the 5 s dwell/ON interval.
+    assert window.cont_sample_window.value() == 3.0
+    assert window.pulse_sample_window.value() == 3.0
     assert window.cont_sample_window.isEnabled()
 
     # Switch to Pulse mode to verify pulse_sample_window is enabled
@@ -1966,6 +2119,8 @@ def test_step_current_delayed_auto_recording(tmp_path):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
     window = MainWindow()
     window.store = WorkbookStore(tmp_path / "step_test.xlsx")
+    window.cap_val = 50.0
+    window.manual_target_spin.setMaximum(50.0)
     window.show()
     window.simulation.setChecked(True)
 
@@ -1982,7 +2137,7 @@ def test_step_current_delayed_auto_recording(tmp_path):
     assert window.run_stack.currentIndex() == 1
 
     # Check defaults under Advanced
-    assert window.step_auto_delay.value() == 3.0
+    assert window.step_auto_delay.value() == 4.0
     assert window.step_auto_save.isChecked() is True
     assert window.step_auto_capture.isChecked() is True
     assert window.step_status_lbl.text() == "READY"
@@ -1998,9 +2153,9 @@ def test_step_current_delayed_auto_recording(tmp_path):
     assert window.hub.environment.load_enabled is True
     assert "2.00 A · ON" in window.step_present_lbl.text()
 
-    # Verify buttons locking during settling: +2 A & −5 A disabled, ZERO / OFF enabled
+    # Upward actions lock; unload and ZERO/OFF retain priority.
     assert window.btn_plus_step.isEnabled() is False
-    assert window.btn_minus_step.isEnabled() is False
+    assert window.btn_minus_step.isEnabled() is True
     assert window.btn_step_zero.isEnabled() is True
     assert window._step_countdown_timer.isActive() is True
     assert "SETTLING" in window.step_status_lbl.text()
@@ -2054,15 +2209,25 @@ def test_step_current_delayed_auto_recording(tmp_path):
     statuses = [m["Status"] for m in updated_measurements]
     assert "Superseded" in statuses
     assert "Valid" in statuses
+    assert window._manual_target_current == 4.0
+    assert window.manual_target_spin.value() == 4.0
 
-    # 5. Test Safety ZERO / OFF cancellation during settling
+    # 5. A downward unload interrupts an unfinished upward point without saving it.
     window.btn_plus_step.click()
     wait_for_ui(lambda: window._step_countdown_timer.isActive())
     assert window._manual_target_current == 6.0
     assert window._step_countdown_timer.isActive() is True
     assert window.btn_plus_step.isEnabled() is False
+    assert window.btn_minus_step.isEnabled() is True
+    window.btn_minus_step.click()
+    wait_for_ui(lambda: not window._step_is_busy())
+    assert window._manual_target_current == 1.0
+    assert 6.0 not in [m["RequestedIout_A"] for m in window.store.get_run_measurements(window._step_run_id)]
 
-    # Press ZERO / OFF
+    # 6. ZERO/OFF has the same priority during another unfinished upward point.
+    window.btn_plus_step.click()
+    wait_for_ui(lambda: window._step_countdown_timer.isActive())
+    assert window._manual_target_current == 3.0
     window.btn_step_zero.click()
     QtWidgets.QApplication.processEvents()
 
@@ -2078,7 +2243,7 @@ def test_step_current_delayed_auto_recording(tmp_path):
     assert "_StepCurrent_2to4A" in closed_step["CampaignName"]
     assert len(window.store.get_run_measurements(closed_step["RunID"])) >= 2
 
-    # 6. Distinct Points: Step to 2 A again after zeroing produces a distinct run/point ID
+    # 7. Distinct Points: Step to 2 A again after zeroing produces a distinct run/point ID
     window.btn_plus_step.click()
     wait_for_ui(lambda: window._step_countdown_timer.isActive())
     assert window._manual_target_current == 2.0
@@ -2358,10 +2523,9 @@ def test_delete_run_single_selection_and_duplicate_safety(tmp_path: Path, monkey
     assert len(store.list_runs()) == 1
     assert store.list_runs()[0]["RunID"] == "RUN-222-bbb"
 
-    # 4. Nonexistent RunID
-    with pytest.raises(RuntimeError) as exc_info2:
-        store.delete_run("RUN-NONEXISTENT")
-    assert "Run RUN-NONEXISTENT no longer exists. Refresh History." in str(exc_info2.value)
+    # 4. Nonexistent RunID is an idempotent stale-selection refresh, not an error.
+    assert store.delete_run("RUN-NONEXISTENT") == []
+    assert [run["RunID"] for run in store.list_runs()] == ["RUN-222-bbb"]
 
     window.close()
 
@@ -2425,6 +2589,29 @@ def test_delete_multiple_selected_runs_batch(tmp_path: Path):
     assert len(store.get_run_measurements(runs_after[0]["RunID"])) == 1
 
     window.close()
+
+
+def test_delete_run_preserves_workbook_integrity_when_capture_is_already_missing(tmp_path: Path):
+    store = WorkbookStore(tmp_path / "results" / "hardware_campaign.xlsx")
+    run_id = "RUN-CAPTURE-CLEANUP"
+    store.create_run(run_record(run_id, "Hardware"))
+    capture_dir = capture_root_for_source(store.path, "Hardware")
+    capture_dir.mkdir(parents=True)
+    existing_png = capture_dir / "point.png"
+    existing_png.write_bytes(b"png")
+    missing_csv = capture_dir / "already_missing.csv"
+    record = {name: "" for name in MEAS_HEADERS}
+    record.update({
+        "PointID": "P1", "RunID": run_id, "Status": "Valid", "DataSource": "Hardware",
+        "ScopePNG": str(existing_png), "ScopeCSV": str(missing_csv),
+    })
+    store.append_measurement(record)
+
+    assert store.delete_run(run_id) == [existing_png]
+    assert not existing_png.exists()
+    assert store.list_runs() == []
+    assert store.get_run_measurements(run_id) == []
+    assert store.delete_run(run_id) == []
 
 
 
@@ -2620,6 +2807,8 @@ def test_set_current_mode_delayed_auto_recording(tmp_path: Path):
 
     window = MainWindow()
     window.store = store
+    window.cap_val = 50.0
+    window.manual_target_spin.setMaximum(50.0)
     window.show()
     window.simulation.setChecked(True)
     window.btn_mode_direct.click()
@@ -2634,7 +2823,7 @@ def test_set_current_mode_delayed_auto_recording(tmp_path: Path):
 
     # 1. Verify SET CURRENT initial UI elements and Advanced Disclosure
     assert window.direct_adv_box.isHidden()
-    assert window.direct_auto_delay.value() == 3.0
+    assert window.direct_auto_delay.value() == 4.0
     assert window.direct_auto_save.isChecked() is True
     assert window.direct_auto_capture.isChecked() is True
     assert window.direct_status_lbl.text() == "READY"
@@ -2661,6 +2850,9 @@ def test_set_current_mode_delayed_auto_recording(tmp_path: Path):
     assert window.btn_direct_set.isEnabled() is False
     assert window.btn_direct_zero.isEnabled() is True  # ZERO / OFF is safety action and stays enabled
     assert window.emergency_stop_btn.isEnabled() is True
+    assert window.manual_target_spin.isEnabled() is True
+    window.manual_target_spin.setValue(4.0)  # Prepare the next target; it must not auto-run.
+    assert window._manual_target_current == 17.0
     assert window._manual_countdown_timer.isActive() is True
     assert "SETTLING" in window.direct_status_lbl.text()
 
@@ -3256,25 +3448,25 @@ def test_sweep_time_estimation_uses_hard_dwell():
     window.cont_stop.setValue(20.0)
     window.cont_step.setValue(2.0)
     window.cont_settle.setValue(5.0)
-    window.cont_sample_window.setValue(1.5)  # Measure last = 1.5 s
+    window.cont_sample_window.setValue(3.0)  # Measure last is inside the 5 s wait
     window._update_sweep_summary()
 
-    # Total estimated time should be 11 * 5.0 = 55 s (not 11 * (5.0 + 1.5) = 71.5 s)
+    # Total estimated time is 11 * 5.0 = 55 s, not 11 * (5.0 + 3.0).
     assert "11 points" in window.cont_summary_lbl.text()
     assert "~55 s" in window.cont_summary_lbl.text()
 
-    # 2. Pulse: 0 to 20 A in 2 A steps = 11 pulses. ON time = 3.0 s, Rest = 4.0 s.
+    # 2. Pulse: 0 to 20 A in 2 A steps = 11 pulses. ON = 5 s, Rest = 5 s.
     window.pulse_start.setValue(0.0)
     window.pulse_stop.setValue(20.0)
     window.pulse_step.setValue(2.0)
-    window.pulse_dwell.setValue(3.0)
-    window.pulse_cooldown.setValue(4.0)
-    window.pulse_sample_window.setValue(1.5)
+    window.pulse_dwell.setValue(5.0)
+    window.pulse_cooldown.setValue(5.0)
+    window.pulse_sample_window.setValue(3.0)
     window._update_sweep_summary()
 
-    # Total estimated time should be 11 * (3.0 + 4.0) = 77 s
+    # Measure-last stays inside ON time; estimate is 11 * (5.0 + 5.0) = 110 s.
     assert "11 pulses" in window.pulse_summary_lbl.text()
-    assert "~77 s" in window.pulse_summary_lbl.text()
+    assert "~110 s" in window.pulse_summary_lbl.text()
 
     window.close()
 
@@ -3401,10 +3593,10 @@ def test_manual_mode_range_and_plot_scaling_authority():
     assert x_range[0] <= 0.01
     assert x_range[1] >= 69.9  # approx 70 A (with padding)
 
-    # Empty Efficiency y-axis must be 0..100%
+    # Empty Efficiency y-axis uses default efficiency bounds 90..100%
     y_range = window.live_plot_widget.getPlotItem().getViewBox().viewRange()[1]
-    assert y_range[0] <= 0.01
-    assert y_range[1] >= 99.9
+    assert y_range[0] <= 90.5
+    assert y_range[1] >= 99.5
 
     # 3. Check STEP CURRENT mode (Mode 1)
     window.btn_mode_step.click()
@@ -3421,7 +3613,7 @@ def test_manual_mode_range_and_plot_scaling_authority():
     assert window.manual_target_spin.value() == 70.0
 
     # 4. Switch to CONTINUOUS mode (Mode 2)
-    window.btn_mode_cont.click()
+    window.btn_mode_cont.setChecked(True)
     QtWidgets.QApplication.processEvents()
 
     # Progress bar and plot must restore Continuous sweep range (0..60 A)
@@ -3433,7 +3625,7 @@ def test_manual_mode_range_and_plot_scaling_authority():
     # 5. Switch to PULSE mode (Mode 3)
     window.pulse_start.setValue(0.0)
     window.pulse_stop.setValue(40.0)
-    window.btn_mode_pulse.click()
+    window.btn_mode_pulse.setChecked(True)
     QtWidgets.QApplication.processEvents()
 
     assert window.plot_progress_marker.start_val == 0.0
@@ -3447,7 +3639,7 @@ def test_manual_mode_range_and_plot_scaling_authority():
     assert window.manual_mode_max_current() == 80.0
 
     # Switch back to STEP CURRENT and verify immediate dynamic update to 80 A
-    window.btn_mode_step.click()
+    window.btn_mode_step.setChecked(True)
     QtWidgets.QApplication.processEvents()
     assert window.plot_progress_marker.stop_val == 80.0
     x_range_step = window.live_plot_widget.getPlotItem().getViewBox().viewRange()[0]
@@ -3630,6 +3822,13 @@ def test_chroma_63206a_scpi_commands_bench_diagnostics_and_run_behavior(tmp_path
     load.set_input(False)
     assert "LOAD OFF" in commands_written
 
+    # Safe shutdown de-energizes first, then clears the stored current setpoint.
+    commands_written.clear()
+    load.safe_off()
+    assert "LOAD OFF" in commands_written
+    assert "CURRent:STATic:L1 0" in commands_written
+    assert commands_written.index("LOAD OFF") < commands_written.index("CURRent:STATic:L1 0")
+
     # C. read_snapshot(include_voltage=True) for Bench Setup
     commands_written.clear()
     queries_made.clear()
@@ -3726,11 +3925,54 @@ def test_chroma_63206a_scpi_commands_bench_diagnostics_and_run_behavior(tmp_path
     window.close()
 
 
+def test_plot_visual_smoothness_and_pen_styling():
+    """Verify pyqtgraph antialiasing, round cap/join pens, 7px markers, and discrete linear data handling."""
+    import os
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets, QtCore, QtGui
+    import pyqtgraph as pg
+    from sid_bench_gui import MainWindow, make_smooth_pen, PLOT_CORE_BLUE, PLOT_SYSTEM_ORANGE, PLOT_AUX_TEAL
 
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
 
+    # 1. Antialiasing is enabled globally
+    assert pg.getConfigOption("antialias") is True
 
+    # 2. make_smooth_pen returns QPen with round cap/join and ~2.2px width
+    pen = make_smooth_pen("#002676", width=2.2)
+    assert isinstance(pen, QtGui.QPen)
+    assert abs(pen.widthF() - 2.2) < 1e-4
+    assert pen.capStyle() == QtCore.Qt.PenCapStyle.RoundCap
+    assert pen.joinStyle() == QtCore.Qt.PenJoinStyle.RoundJoin
 
+    # 3. Live plot curves styling: ~2.2px width, ~7px markers, solid filled symbols
+    window = MainWindow()
+    curves = [window.live_curve, window.live_system_curve, window.live_aux_curve]
+    for curve in curves:
+        c_pen = curve.opts["pen"]
+        assert isinstance(c_pen, QtGui.QPen)
+        assert abs(c_pen.widthF() - 2.2) < 1e-4
+        assert c_pen.capStyle() == QtCore.Qt.PenCapStyle.RoundCap
+        assert c_pen.joinStyle() == QtCore.Qt.PenJoinStyle.RoundJoin
+        assert curve.opts["symbolSize"] == 7
+        assert curve.opts["symbol"] in ("o", "s", "t")
 
+    # 4. Discrete straight lines without interpolation
+    test_points = [
+        {"Status": "Valid", "Iout_A": 5.0, "EfficiencyConverter_pct": 94.2, "EfficiencySystem_pct": 92.1},
+        {"Status": "Valid", "Iout_A": 15.0, "EfficiencyConverter_pct": 96.8, "EfficiencySystem_pct": 95.0},
+        {"Status": "Valid", "Iout_A": 25.0, "EfficiencyConverter_pct": 95.5, "EfficiencySystem_pct": 93.8},
+    ]
+    window.plot_rows = test_points
+    window._switch_live_plot(0)
 
+    # Actual data array matches exact measured points (no spline/curve-fit points injected)
+    xs, ys = window.live_curve.getData()
+    assert list(xs) == [5.0, 15.0, 25.0]
+    assert list(ys) == [94.2, 96.8, 95.5]
 
+    sys_xs, sys_ys = window.live_system_curve.getData()
+    assert list(sys_xs) == [5.0, 15.0, 25.0]
+    assert list(sys_ys) == [92.1, 95.0, 93.8]
 
+    window.close()

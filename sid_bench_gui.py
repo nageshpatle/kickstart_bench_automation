@@ -32,6 +32,17 @@ from typing import Any, Callable
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
+pg.setConfigOptions(antialias=True)
+
+
+def make_smooth_pen(color: Any, width: float = 2.2) -> QtGui.QPen:
+    """Create a polished antialiased pen with rounded caps and joins for discrete curve rendering."""
+    pen = pg.mkPen(color, width=width)
+    pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+    return pen
+
+
 from sid_instruments import (
     InstrumentError,
     InstrumentHub,
@@ -67,6 +78,9 @@ MODE_CONT = "#004AAE"
 MODE_PULSE = "#002676"
 SUCCESS_GREEN = "#166534"
 WARNING_AMBER = "#B45309"
+PLOT_CORE_BLUE = "#002676"
+PLOT_SYSTEM_ORANGE = "#D97706"
+PLOT_AUX_TEAL = "#0F766E"
 DANGER_RED = "#B91C1C"
 
 PALETTE = [
@@ -199,6 +213,44 @@ def save_config(config: dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
+def format_frequency_khz(frequency_hz: Any) -> str:
+    """Format a stored Hz value for operator-facing kHz displays."""
+    try:
+        return f"{float(frequency_hz) / 1000.0:g} kHz"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def capture_root_for_source(workbook_path: Path, source: str) -> Path:
+    """Return the one authoritative scope-capture folder for a data source."""
+    source_folder = "hardware" if str(source).strip().lower() == "hardware" else "simulation"
+    return Path(workbook_path).parent / "captures" / source_folder
+
+
+def efficiency_axis_bounds(values: list[float], minimum_span: float = 10.0) -> tuple[float, float]:
+    """Round live efficiency bounds outward to 5% steps with breathing room."""
+    finite = [float(value) for value in values if isinstance(value, (int, float)) and math.isfinite(float(value))]
+    if not finite:
+        return 90.0, 100.0
+    low, high = min(finite), max(finite)
+    y_min = math.floor(low / 5.0) * 5.0
+    y_max = math.ceil(high / 5.0) * 5.0
+    if math.isclose(low, y_min, abs_tol=1e-9):
+        y_min -= 5.0
+    if math.isclose(high, y_max, abs_tol=1e-9):
+        y_max += 5.0
+    y_min = max(0.0, y_min)
+    y_max = min(105.0, y_max)
+    while y_max - y_min < minimum_span - 1e-9:
+        if y_min >= 5.0:
+            y_min -= 5.0
+        elif y_max <= 100.0:
+            y_max += 5.0
+        else:
+            break
+    return y_min, y_max
+
+
 def parse_points(text: str) -> list[float]:
     points: list[float] = []
     for token in (item.strip() for item in text.split(",")):
@@ -316,7 +368,7 @@ def fpga_snapshot(fpga_root: Path, expected_frequency: float | None = None) -> t
         actual = payload.get("top_frequency_hz")
         if expected_frequency and actual and abs(float(actual) - expected_frequency) > 0.5:
             status = "Mismatch"
-            warning = f"FPGA top.v frequency {actual:g} Hz differs from requested {expected_frequency:g} Hz"
+            warning = f"FPGA top.v frequency {format_frequency_khz(actual)} differs from requested {format_frequency_khz(expected_frequency)}"
         return status, payload, warning
     except Exception as exc:
         return "Failed", {}, str(exc)
@@ -713,6 +765,31 @@ class WorkbookStore:
                     break
             self._save_atomic(wb)
 
+    def discard_interrupted_point(self, pid: str, run_id: str, reason: str) -> bool:
+        """Remove an interrupted point and its run shell when no completed point remains."""
+        with self._lock:
+            wb = self._load()
+            sheet = wb["Measurements"]
+            pid_col = MEAS_HEADERS.index("PointID") + 1
+            removed = False
+            for row in range(sheet.max_row, 1, -1):
+                if str(sheet.cell(row, pid_col).value or "").strip() == pid:
+                    sheet.delete_rows(row, 1)
+                    removed = True
+            run_col = MEAS_HEADERS.index("RunID") + 1
+            run_has_points = any(str(sheet.cell(row, run_col).value or "").strip() == run_id for row in range(2, sheet.max_row + 1))
+            if not run_has_points:
+                runs = wb["Runs"]
+                runs_id_col = RUN_HEADERS.index("RunID") + 1
+                for row in range(runs.max_row, 1, -1):
+                    if str(runs.cell(row, runs_id_col).value or "").strip() == run_id:
+                        runs.delete_rows(row, 1)
+            if removed:
+                self._append(wb["Events"], EVENT_HEADERS, {"Timestamp": utc_now(), "RunID": run_id, "PointID": pid, "Event": "Point discarded", "Detail": reason})
+                self._refresh_plot(wb)
+                self._save_atomic(wb)
+            return removed
+
     def _matching_rows(self, sheet, record: dict[str, Any]) -> list[int]:
         # A point is only a duplicate inside the same run type.  A 2 A pulse is
         # not interchangeable with a 2 A continuous or manual measurement.
@@ -895,11 +972,6 @@ class WorkbookStore:
                     if val_str in matching_run_rows:
                         matching_run_rows[val_str].append(row)
 
-            # Pre-verification: check missing
-            for rid in unique_run_ids:
-                if len(matching_run_rows[rid]) == 0:
-                    raise RuntimeError(f"Run {rid} no longer exists. Refresh History.")
-
             # Delete measurements belonging to target runs and collect linked captures
             captures: list[str] = []
             m_sheet = wb["Measurements"]
@@ -917,6 +989,13 @@ class WorkbookStore:
             all_rows_to_delete = sorted([r for rid in unique_run_ids for r in matching_run_rows[rid]], reverse=True)
             for row in all_rows_to_delete:
                 r_sheet.delete_rows(row)
+
+            # Remove stale run events/index references before writing one deletion audit event.
+            e_sheet = wb["Events"]
+            e_run_col = EVENT_HEADERS.index("RunID") + 1
+            for row in range(e_sheet.max_row, 1, -1):
+                if str(e_sheet.cell(row, e_run_col).value or "").strip() in target_set:
+                    e_sheet.delete_rows(row)
 
             # Post-delete verification: ensure target RunIDs no longer exist in Runs
             final_run_ids: list[str] = []
@@ -1053,7 +1132,7 @@ def calculate_measurement(
         "Vdrv_C_V": vdrv_c, "Idrv_C_A": idrv_c, "Pdrv_C_W": pdrv_c,
         "Paux_W": paux, "LossConverter_W": loss_converter, "LossSystem_W": loss_system,
         "EfficiencyConverter_pct": 100.0 * pout / pin,
-        "EfficiencySystem_pct": 100.0 * pout / system_pin if system_pin > 0 else None,
+        "EfficiencySystem_pct": 100.0 * pout / system_pin if psu is not None and system_pin > 0 else None,
         "SupplyMeasurements": supply_result,
     }
     if derived["EfficiencyConverter_pct"] > 100.0:
@@ -1137,6 +1216,13 @@ class NoWheelFilter(QtCore.QObject):
                 event.ignore()
                 return True
         return super().eventFilter(obj, event)
+
+
+class CompactDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+    """A numeric control that retains precision without showing trailing zeroes."""
+
+    def textFromValue(self, value: float) -> str:
+        return f"{value:g}"
 
 
 class ModeIndicator(QtWidgets.QWidget):
@@ -1412,13 +1498,7 @@ class DeleteRunDialog(QtWidgets.QDialog):
         vin_str = f"{float(vin_val):g} V" if isinstance(vin_val, (int, float)) or (isinstance(vin_val, str) and vin_val.replace(".", "", 1).isdigit()) else str(vin_val or "—")
 
         freq_val = run_info.get("Frequency_Hz")
-        if isinstance(freq_val, (int, float)):
-            freq_str = f"{freq_val / 1000:g} kHz" if freq_val >= 1000 else f"{freq_val:g} Hz"
-        elif isinstance(freq_val, str) and freq_val.replace(".", "", 1).isdigit():
-            fv = float(freq_val)
-            freq_str = f"{fv / 1000:g} kHz" if fv >= 1000 else f"{fv:g} Hz"
-        else:
-            freq_str = str(freq_val or "—")
+        freq_str = format_frequency_khz(freq_val)
 
         status_str = str(run_info.get("Status") or "—")
         source_str = str(run_info.get("DataSource") or "—")
@@ -2180,10 +2260,12 @@ class ScopeCard(QtWidgets.QGroupBox):
     snapshot = QtCore.pyqtSignal(str, object)
     message = QtCore.pyqtSignal(str)
 
-    def __init__(self, hub: InstrumentHub, store_getter: Callable[[], WorkbookStore]):
+    def __init__(self, hub: InstrumentHub, store_getter: Callable[[], WorkbookStore],
+                 source_getter: Callable[[], str] | None = None):
         super().__init__("MSOX4024A Scope")
         self.hub = hub
         self.store_getter = store_getter
+        self.source_getter = source_getter or (lambda: "Hardware")
         self.last_snapshot: InstrumentSnapshot | None = None
         self.last_png_path: Path | None = None
         self.busy = False
@@ -2294,7 +2376,7 @@ class ScopeCard(QtWidgets.QGroupBox):
         self.capture_btn.setText("Capturing...")
 
         store = self.store_getter()
-        cap_dir = store.path.parent / "captures"
+        cap_dir = capture_root_for_source(store.path, self.source_getter())
         cap_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         png_path = cap_dir / f"scope_manual_{stamp}.png"
@@ -2335,7 +2417,7 @@ class ScopeCard(QtWidgets.QGroupBox):
 
     def open_captures_folder(self):
         store = self.store_getter()
-        cap_dir = store.path.parent / "captures"
+        cap_dir = capture_root_for_source(store.path, self.source_getter())
         cap_dir.mkdir(parents=True, exist_ok=True)
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(cap_dir.resolve())))
 
@@ -2555,7 +2637,7 @@ class SweepWorker(QtCore.QThread):
     def _ramp_down_to_zero(self, starting_amps: float):
         if starting_amps <= 0:
             try:
-                self.hub.instruments["load"].set_input(False)
+                self.hub.instruments["load"].safe_off()
             except Exception:
                 pass
             return
@@ -2577,10 +2659,7 @@ class SweepWorker(QtCore.QThread):
                 pass
             self.ramp_progress.emit(current)
             time.sleep(0.15)
-        try:
-            load.set_input(False)
-        except Exception:
-            pass
+        load.safe_off()
 
     def _measure_average(self, count: int, window: float) -> tuple[InstrumentSnapshot, InstrumentSnapshot, InstrumentSnapshot | None]:
         channels = [channel.channel for channel in self.settings["supply_channels"] if channel.displayed]
@@ -2689,7 +2768,8 @@ class SweepWorker(QtCore.QThread):
                 pid = point_id(run_id, index)
                 capture_status, capture_error, png_value, csv_value = "Skipped", "", "", ""
                 if any(abs(amps - point) <= 0.05 for point in self.settings["capture_points"]):
-                    capture_dir = self.store.path.parent / "captures"
+                    capture_dir = capture_root_for_source(self.store.path, self.settings["data_source"])
+                    capture_dir.mkdir(parents=True, exist_ok=True)
                     png_path = capture_dir / f"{pid}.png"
                     csv_path = capture_dir / f"{pid}.csv"
                     try:
@@ -2708,7 +2788,7 @@ class SweepWorker(QtCore.QThread):
                     self._wait(time_left, load_active=True)
 
                 if self.settings["mode"] == "Pulse":
-                    load.set_input(False)
+                    load.safe_off()
                     last_commanded_amps = 0.0
 
                 record = {
@@ -2732,7 +2812,7 @@ class SweepWorker(QtCore.QThread):
                 self._ramp_down_to_zero(last_commanded_amps)
             else:
                 try:
-                    load.set_input(False)
+                    load.safe_off()
                 except Exception:
                     pass
 
@@ -2762,7 +2842,7 @@ class SweepWorker(QtCore.QThread):
                             pass
                 else:
                     try:
-                        load.set_input(False)
+                        load.safe_off()
                     except Exception:
                         pass
                 status = "Stopped"
@@ -2829,6 +2909,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._manual_point_id = ""
         self._manual_last_record: dict[str, Any] | None = None
         self._manual_active_task = False
+        self.point_action_busy = False
         self._manual_mode_name = "Set Current"
         self._manual_point_index = -1
         self._manual_run_created = False
@@ -3223,14 +3304,16 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addStretch()
 
 
-        # KPIs in Header (Breathing, boxless vertical layout with prominent values)
+        # KPIs in Header (direct measurements in navy, derived power metrics in amber)
         self.kpi_labels: dict[str, QtWidgets.QLabel] = {}
-        kpi_container = QtWidgets.QHBoxLayout()
-        kpi_container.setSpacing(22)
+        direct_kpis = QtWidgets.QHBoxLayout()
+        direct_kpis.setSpacing(14)
+        derived_kpis = QtWidgets.QHBoxLayout()
+        derived_kpis.setSpacing(12)
 
-        for name in ("Vin", "Iin", "Vout", "Iout", "Eff"):
+        def add_kpi(target: QtWidgets.QHBoxLayout, name: str, value_color: str):
             kpi_col = QtWidgets.QVBoxLayout()
-            kpi_col.setContentsMargins(4, 0, 4, 0)
+            kpi_col.setContentsMargins(2, 0, 2, 0)
             kpi_col.setSpacing(1)
 
             tag = QtWidgets.QLabel(name)
@@ -3238,16 +3321,27 @@ class MainWindow(QtWidgets.QMainWindow):
             tag.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
             val = QtWidgets.QLabel("—")
-            val.setStyleSheet(f"color: {BERKELEY_BLUE}; font-family: Consolas, 'Segoe UI', monospace; font-weight: 800; font-size: 20px; letter-spacing: -0.5px;")
+            val.setStyleSheet(f"color: {value_color}; font-family: Consolas, 'Segoe UI', monospace; font-weight: 800; font-size: 20px; letter-spacing: -0.5px;")
             val.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
             kpi_col.addWidget(tag)
             kpi_col.addWidget(val)
             self.kpi_labels[name] = val
-            kpi_container.addLayout(kpi_col)
+            target.addLayout(kpi_col)
 
-        row.addLayout(kpi_container)
-        row.addSpacing(16)
+        for name in ("Vin", "Iin", "Vout", "Iout"):
+            add_kpi(direct_kpis, name, BERKELEY_BLUE)
+        for name in ("Pin", "Pout", "Eff"):
+            add_kpi(derived_kpis, name, WARNING_AMBER)
+
+        row.addLayout(direct_kpis)
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        separator.setStyleSheet(f"color: {BORDER};")
+        separator.setFixedHeight(34)
+        row.addWidget(separator)
+        row.addLayout(derived_kpis)
+        row.addSpacing(8)
 
         # Single Emergency Stop Button (Top-Right)
         self.emergency_stop_btn = QtWidgets.QPushButton("LOAD OFF")
@@ -3291,7 +3385,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.step_actual_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 22px; font-weight: 800;")
         def stop_cmd():
             load = self.hub.instruments["load"]
-            load.set_current(0.0)
             load.safe_off()
         self._run_function(stop_cmd, lambda _: self.statusBar().showMessage("Electronic load OFF (0.00 A)"))
 
@@ -3315,7 +3408,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_load.toggled.connect(lambda _: self.update_enabled_states())
 
         self.supply_card = SupplyCard(self.hub, self.config, lambda: save_config(self.config))
-        self.scope_card = ScopeCard(self.hub, lambda: self.store)
+        self.scope_card = ScopeCard(
+            self.hub,
+            lambda: self.store,
+            lambda: "Simulation" if self.simulation.isChecked() else "Hardware",
+        )
         self.cards = {
             "pa": InstrumentCard("pa", "PA2201A Analyzer", [("Vin", "V"), ("Iin", "A"), ("Vout", "V")], lambda: self.hub.instruments["pa"]),
             "load": self.load_card,
@@ -3625,15 +3722,16 @@ class MainWindow(QtWidgets.QMainWindow):
         ss_lay.addWidget(self.vin_target)
 
         # Switching Frequency
-        ss_lay.addWidget(QtWidgets.QLabel("<b>Switching Frequency:</b>"))
-        self.frequency = QtWidgets.QDoubleSpinBox()
-        self.frequency.setRange(1, 10_000_000)
-        self.frequency.setDecimals(0)
-        self.frequency.setValue(float(self.config.get("frequency_hz", 100_000)))
-        self.frequency.setSuffix(" Hz")
+        ss_lay.addWidget(QtWidgets.QLabel("<b>Switching Frequency (kHz):</b>"))
+        self.frequency = CompactDoubleSpinBox()
+        self.frequency.setRange(0.001, 10_000)
+        self.frequency.setDecimals(3)
+        self.frequency.setValue(float(self.config.get("frequency_hz", 100_000)) / 1000.0)
+        self.frequency.setSuffix(" kHz")
+        self.frequency.setSingleStep(10.0)
         self.frequency.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.frequency.setFixedWidth(105)
-        self.frequency.setToolTip("Switching frequency of the converter under test.")
+        self.frequency.setToolTip("Switching frequency in kHz. Stored run data remains in Hz for compatibility.")
         ss_lay.addWidget(self.frequency)
 
         outer.addWidget(setup_strip)
@@ -3801,7 +3899,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.direct_auto_delay = QtWidgets.QDoubleSpinBox()
         self.direct_auto_delay.setRange(0.5, 60.0)
         self.direct_auto_delay.setSingleStep(0.5)
-        self.direct_auto_delay.setValue(3.0)
+        self.direct_auto_delay.setValue(4.0)
         self.direct_auto_delay.setSuffix(" s")
         self.direct_auto_delay.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.direct_auto_delay.setToolTip("Wait time after setting current before recording measurement and/or scope capture.")
@@ -3947,7 +4045,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.step_auto_delay = QtWidgets.QDoubleSpinBox()
         self.step_auto_delay.setRange(0.5, 60.0)
         self.step_auto_delay.setSingleStep(0.5)
-        self.step_auto_delay.setValue(3.0)
+        self.step_auto_delay.setValue(4.0)
         self.step_auto_delay.setSuffix(" s")
         self.step_auto_delay.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.step_auto_delay.setToolTip("Wait time after setting current before recording measurement and/or scope capture.")
@@ -4013,8 +4111,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cont_start = QtWidgets.QDoubleSpinBox(); self.cont_start.setRange(0, 2000); self.cont_start.setValue(0.0); self.cont_start.setSuffix(" A"); self.cont_start.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.cont_stop = QtWidgets.QDoubleSpinBox(); self.cont_stop.setRange(0, 2000); self.cont_stop.setValue(60.0); self.cont_stop.setSuffix(" A"); self.cont_stop.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.cont_step = QtWidgets.QDoubleSpinBox(); self.cont_step.setRange(0.01, 100); self.cont_step.setValue(2.0); self.cont_step.setSuffix(" A"); self.cont_step.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.cont_settle = QtWidgets.QDoubleSpinBox(); self.cont_settle.setRange(0.1, 120); self.cont_settle.setValue(3.0); self.cont_settle.setSuffix(" s"); self.cont_settle.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.cont_settle.setToolTip("Dwell time to hold load at current before reading snapshot.")
+        self.cont_settle = QtWidgets.QDoubleSpinBox(); self.cont_settle.setRange(0.1, 120); self.cont_settle.setValue(5.0); self.cont_settle.setSuffix(" s"); self.cont_settle.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.cont_settle.setToolTip("Total dwell at each current point. Measure last occurs inside this interval.")
 
         for sp in (self.cont_start, self.cont_stop, self.cont_step, self.cont_settle):
             sp.valueChanged.connect(self._update_sweep_summary)
@@ -4038,8 +4136,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cont_sample_count.setToolTip("Number of readings averaged per point (1 = single snapshot).")
         self.cont_sample_count.valueChanged.connect(self._update_sample_controls)
 
-        self.cont_sample_window = QtWidgets.QDoubleSpinBox(); self.cont_sample_window.setRange(0.05, 30); self.cont_sample_window.setValue(1.5); self.cont_sample_window.setSuffix(" s"); self.cont_sample_window.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.cont_sample_window.setToolTip("Acquisition region at the end of the total wait time (default 1.5 s for 1.0 s PA window + 0.5 s VISA overhead).")
+        self.cont_sample_window = QtWidgets.QDoubleSpinBox(); self.cont_sample_window.setRange(0.05, 30); self.cont_sample_window.setValue(3.0); self.cont_sample_window.setSuffix(" s"); self.cont_sample_window.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.cont_sample_window.setToolTip("Acquisition region during the final part of the total Wait interval.")
         self.cont_sample_window.valueChanged.connect(self._update_sweep_summary)
 
         self.cont_capture_points = QtWidgets.QLineEdit("0, 10, 20, 30")
@@ -4070,7 +4168,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cont_outer.addLayout(cont_cols)
 
         # Compact Status strip (35-45px high)
-        self.cont_summary_lbl = QtWidgets.QLabel("0 → 60 A   |   31 points   |   ~93 s")
+        self.cont_summary_lbl = QtWidgets.QLabel("0 → 60 A   |   31 points   |   ~155 s")
         self.cont_summary_lbl.setFixedHeight(38)
         self.cont_summary_lbl.setStyleSheet(f"color: #166534; font-weight: 700; font-size: 12px; padding: 4px 8px; background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 4px;")
         self.cont_summary_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -4107,9 +4205,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pulse_start = QtWidgets.QDoubleSpinBox(); self.pulse_start.setRange(0, 2000); self.pulse_start.setValue(0.0); self.pulse_start.setSuffix(" A"); self.pulse_start.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.pulse_stop = QtWidgets.QDoubleSpinBox(); self.pulse_stop.setRange(0, 2000); self.pulse_stop.setValue(60.0); self.pulse_stop.setSuffix(" A"); self.pulse_stop.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.pulse_step = QtWidgets.QDoubleSpinBox(); self.pulse_step.setRange(0.01, 100); self.pulse_step.setValue(2.0); self.pulse_step.setSuffix(" A"); self.pulse_step.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.pulse_dwell = QtWidgets.QDoubleSpinBox(); self.pulse_dwell.setRange(0.1, 120); self.pulse_dwell.setValue(3.0); self.pulse_dwell.setSuffix(" s"); self.pulse_dwell.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.pulse_dwell = QtWidgets.QDoubleSpinBox(); self.pulse_dwell.setRange(0.1, 120); self.pulse_dwell.setValue(5.0); self.pulse_dwell.setSuffix(" s"); self.pulse_dwell.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.pulse_dwell.setToolTip("Pulse duration that load holds target current before returning to 0 A.")
-        self.pulse_cooldown = QtWidgets.QDoubleSpinBox(); self.pulse_cooldown.setRange(0.1, 600); self.pulse_cooldown.setValue(3.0); self.pulse_cooldown.setSuffix(" s"); self.pulse_cooldown.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.pulse_cooldown = QtWidgets.QDoubleSpinBox(); self.pulse_cooldown.setRange(0.1, 600); self.pulse_cooldown.setValue(5.0); self.pulse_cooldown.setSuffix(" s"); self.pulse_cooldown.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.pulse_cooldown.setToolTip("Rest cooldown period at 0 A between pulses.")
 
         for sp in (self.pulse_start, self.pulse_stop, self.pulse_step, self.pulse_dwell, self.pulse_cooldown):
@@ -4135,8 +4233,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pulse_sample_count.setToolTip("Number of readings averaged per point (1 = single snapshot).")
         self.pulse_sample_count.valueChanged.connect(self._update_sample_controls)
 
-        self.pulse_sample_window = QtWidgets.QDoubleSpinBox(); self.pulse_sample_window.setRange(0.05, 30); self.pulse_sample_window.setValue(1.5); self.pulse_sample_window.setSuffix(" s"); self.pulse_sample_window.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.pulse_sample_window.setToolTip("Acquisition region at the end of the pulse ON time (default 1.5 s for 1.0 s PA window + 0.5 s VISA overhead).")
+        self.pulse_sample_window = QtWidgets.QDoubleSpinBox(); self.pulse_sample_window.setRange(0.05, 30); self.pulse_sample_window.setValue(3.0); self.pulse_sample_window.setSuffix(" s"); self.pulse_sample_window.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.pulse_sample_window.setToolTip("Acquisition region during the final part of the pulse ON interval.")
         self.pulse_sample_window.valueChanged.connect(self._update_sweep_summary)
 
         self.pulse_capture_points = QtWidgets.QLineEdit("0, 10, 20, 30")
@@ -4167,7 +4265,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pulse_outer.addLayout(pulse_cols)
 
         # Compact Status strip (35-45px high)
-        self.pulse_summary_lbl = QtWidgets.QLabel("0 → 60 A   |   31 pulses   |   ~186 s")
+        self.pulse_summary_lbl = QtWidgets.QLabel("0 → 60 A   |   31 pulses   |   ~310 s")
         self.pulse_summary_lbl.setFixedHeight(38)
         self.pulse_summary_lbl.setStyleSheet(f"color: #166534; font-weight: 700; font-size: 12px; padding: 4px 8px; background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 4px;")
         self.pulse_summary_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -4264,9 +4362,9 @@ class MainWindow(QtWidgets.QMainWindow):
         p_top.setSpacing(8)
         self.live_metric_combo = QtWidgets.QComboBox()
         self.live_metric_combo.addItems([
-            "Converter Efficiency (%)",
-            "System Loss (W)",
-            "Output Power (W)",
+            "Efficiency (%)",
+            "Loss (W)",
+            "Power (W)",
         ])
         self.live_metric_combo.currentIndexChanged.connect(self._switch_live_plot)
         p_top.addWidget(self.live_metric_combo)
@@ -4285,9 +4383,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_plot_widget = pg.PlotWidget(background="w")
         self.live_plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.live_plot_widget.setLabel("bottom", "Output Current (Iout)", "A")
-        self.live_plot_widget.setLabel("left", "Converter Efficiency", "%")
+        self.live_plot_widget.setLabel("left", "Efficiency (%)")
         self.live_plot_widget.setMouseEnabled(x=False, y=False)
-        self.live_curve = self.live_plot_widget.plot([], [], pen=pg.mkPen(PRIMARY_BLUE, width=2.5), symbol="o", symbolBrush=PRIMARY_BLUE, symbolSize=8)
+        self.live_legend = self.live_plot_widget.addLegend(offset=(-12, -12))
+        self.live_legend.anchor((1, 1), (1, 1), offset=(-12, -12))
+        self.live_legend.setBrush(pg.mkBrush(255, 255, 255, 220))
+        self.live_legend.setPen(pg.mkPen(BORDER))
+        pen_core = make_smooth_pen(PLOT_CORE_BLUE, width=2.2)
+        pen_system = make_smooth_pen(PLOT_SYSTEM_ORANGE, width=2.2)
+        pen_aux = make_smooth_pen(PLOT_AUX_TEAL, width=2.2)
+
+        self.live_curve = self.live_plot_widget.plot(
+            [], [], pen=pen_core, symbol="o", symbolBrush=PLOT_CORE_BLUE, symbolPen=pen_core,
+            symbolSize=7,
+        )
+        self.live_system_curve = self.live_plot_widget.plot(
+            [], [], pen=pen_system,
+            symbol="s", symbolBrush=PLOT_SYSTEM_ORANGE, symbolPen=pen_system, symbolSize=7,
+        )
+        self.live_aux_curve = self.live_plot_widget.plot(
+            [], [], pen=pen_aux,
+            symbol="t", symbolBrush=PLOT_AUX_TEAL, symbolPen=pen_aux, symbolSize=7,
+        )
 
         # Centered Watermark Overlay on Plot Canvas (Translucent Orange)
         self.plot_watermark_lbl = QtWidgets.QLabel("DEMO DATA", self.live_plot_widget)
@@ -4317,9 +4434,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """Single source of truth for maximum allowed current in manual modes (SET CURRENT and STEP CURRENT)."""
         return float(self.cap_val)
 
+    def frequency_hz(self) -> float:
+        """Convert the operator-facing kHz control at the storage/hardware boundary."""
+        return float(self.frequency.value()) * 1000.0
+
     def _update_progress_range(self):
         if hasattr(self, "plot_progress_marker"):
-            mode_id = self.mode_group.checkedId() if hasattr(self, "mode_group") else 2
+            mode_id = self._selected_mode_id if self._selected_mode_id is not None else (self.mode_group.checkedId() if hasattr(self, "mode_group") else 2)
             if mode_id in (0, 1):  # SET CURRENT (0) and STEP CURRENT (1)
                 max_safe = self.manual_mode_max_current()
                 self.plot_progress_marker.set_range(0.0, max_safe)
@@ -4332,10 +4453,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _mode_selected(self, button_id: int):
         previous = self._selected_mode_id
+        self._selected_mode_id = button_id
         if previous is not None and previous != button_id:
             self._finalize_manual_session("Mode changed")
             self._clear_live_run_view()
-        self._selected_mode_id = button_id
         self.run_stack.setCurrentIndex(button_id)
         # button_id 0 = SET CURRENT (Manual)
         # button_id 1 = STEP CURRENT (Manual)
@@ -4463,6 +4584,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_rows.clear()
         if hasattr(self, "live_curve"):
             self.live_curve.setData([], [])
+        if hasattr(self, "live_system_curve"):
+            self.live_system_curve.setData([], [])
+        if hasattr(self, "live_aux_curve"):
+            self.live_aux_curve.setData([], [])
         if hasattr(self, "live_stat_tag"):
             self.live_stat_tag.setText("READY ◌")
             self.live_stat_tag.setStyleSheet(f"font-weight: 800; font-size: 12px; color: {TEXT_MUTED};")
@@ -4484,20 +4609,54 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reset_live_plot_view()
 
     def _switch_live_plot(self, index: int):
-        specs = [
-            ("EfficiencyConverter_pct", "Converter Efficiency", "%"),
-            ("LossSystem_W", "System Loss", "W"),
-            ("Pout_W", "Output Power", "W"),
+        metric_specs = [
+            ("Efficiency (%)", [
+                ("EfficiencyConverter_pct", "Converter"),
+                ("EfficiencySystem_pct", "System"),
+            ]),
+            ("Loss (W)", [
+                ("LossConverter_W", "Converter Loss"),
+                ("LossSystem_W", "System Loss"),
+            ]),
+            ("Power (W)", [
+                ("PinConverter_W", "Pin"),
+                ("Pout_W", "Pout"),
+                ("Paux_W", "Paux"),
+            ]),
         ]
-        key, title, unit = specs[index]
-        self.live_plot_widget.setLabel("left", title, unit)
-        pairs = [(row.get("Iout_A"), row.get(key)) for row in self.plot_rows if isinstance(row.get("Iout_A"), (int, float)) and isinstance(row.get(key), (int, float))]
-        xs = [p[0] for p in pairs]
-        ys = [p[1] for p in pairs]
-        self.live_curve.setData(xs, ys)
+        y_label, series_specs = metric_specs[index]
+        self.live_plot_widget.setLabel("left", y_label)
+        curves = [self.live_curve, self.live_system_curve, self.live_aux_curve]
+        self.live_legend.clear()
+        xs: list[float] = []
+        ys: list[float] = []
+        positive_efficiencies: list[float] = []
+
+        for curve_index, curve in enumerate(curves):
+            if curve_index >= len(series_specs):
+                curve.setData([], [])
+                continue
+            field, legend_name = series_specs[curve_index]
+            pairs = [
+                (row.get("Iout_A"), row.get(field)) for row in self.plot_rows
+                if row.get("Status") == "Valid" and isinstance(row.get("Iout_A"), (int, float))
+                and isinstance(row.get(field), (int, float))
+                and math.isfinite(float(row.get("Iout_A"))) and math.isfinite(float(row.get(field)))
+            ]
+            curve.setData([p[0] for p in pairs], [p[1] for p in pairs])
+            self.live_legend.addItem(curve, legend_name)
+            xs.extend(float(p[0]) for p in pairs)
+            ys.extend(float(p[1]) for p in pairs)
+            if index == 0:
+                positive_efficiencies.extend(float(y) for x, y in pairs if float(x) > 1e-6)
+
+        self.live_legend.setVisible(True)
+        if index == 0:
+            y_min, y_max = efficiency_axis_bounds(positive_efficiencies)
+            self.live_plot_widget.setYRange(y_min, y_max, padding=0.02)
 
         # Controlled ranges for X-axis
-        mode_id = self.mode_group.checkedId() if hasattr(self, "mode_group") else 2
+        mode_id = self._selected_mode_id if self._selected_mode_id is not None else (self.mode_group.checkedId() if hasattr(self, "mode_group") else 2)
         if mode_id in (0, 1):  # SET CURRENT (0) and STEP CURRENT (1)
             start_x = 0.0
             stop_x = self.manual_mode_max_current()
@@ -4511,20 +4670,10 @@ class MainWindow(QtWidgets.QMainWindow):
         max_x = max(stop_x, max(xs) if xs else 10.0, 1.0)
         self.live_plot_widget.setXRange(start_x, max_x, padding=0.04)
 
-        if index == 0:  # Efficiency (%)
-            valid_ys = [y for y in ys if math.isfinite(y)]
-            if valid_ys:
-                y_min = min(0.0, min(valid_ys))
-                y_max = max(100.0, max(valid_ys))
-                margin = 2.0 if (y_min < 0.0 or y_max > 100.0) else 0.0
-                self.live_plot_widget.setYRange(y_min - margin, y_max + margin, padding=0.02)
-            else:
-                self.live_plot_widget.setYRange(0.0, 100.0, padding=0.02)
-        else:  # Loss / Power (W)
-            valid_ys = [y for y in ys if math.isfinite(y)]
-            if valid_ys:
-                y_min = min([0.0] + valid_ys)
-                y_max = max([1.0] + valid_ys) * 1.1
+        if index != 0:  # Loss / Power use ordinary numeric bounds.
+            if ys:
+                y_min = min([0.0] + ys)
+                y_max = max([1.0] + ys) * 1.1
                 self.live_plot_widget.setYRange(y_min, y_max, padding=0.02)
             else:
                 self.live_plot_widget.setYRange(0.0, 10.0, padding=0.02)
@@ -4543,7 +4692,7 @@ class MainWindow(QtWidgets.QMainWindow):
         l_layout.setSpacing(8)
 
         self.history_table = QtWidgets.QTableWidget(0, 9)
-        self.history_table.setHorizontalHeaderLabels(["Run Short ID", "RunID", "Full Test Name", "Status", "Source", "Vin", "Freq", "Base Test", "Mode"])
+        self.history_table.setHorizontalHeaderLabels(["Run Short ID", "RunID", "Full Test Name", "Status", "Source", "Vin", "Freq (kHz)", "Base Test", "Mode"])
         self.history_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.history_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
@@ -4588,9 +4737,9 @@ class MainWindow(QtWidgets.QMainWindow):
         top_sel.addWidget(QtWidgets.QLabel("<b>Comparison Metric:</b>"))
         self.comp_metric_combo = QtWidgets.QComboBox()
         self.comp_metric_combo.addItems([
-            "Converter Efficiency (%)",
-            "System Loss (W)",
-            "Output Power (W)",
+            "Efficiency (%)",
+            "Loss (W)",
+            "Power (W)",
         ])
         self.comp_metric_combo.currentIndexChanged.connect(lambda: self._history_selection_changed())
         top_sel.addWidget(self.comp_metric_combo)
@@ -4600,9 +4749,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.comp_plot_widget = pg.PlotWidget(background="w")
         self.comp_plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.comp_plot_widget.setLabel("bottom", "Output Current (Iout)", "A")
-        self.comp_plot_widget.setLabel("left", "Converter Efficiency", "%")
+        self.comp_plot_widget.setLabel("left", "Efficiency (%)")
         self.comp_plot_widget.setMouseEnabled(x=False, y=False)
-        self.comp_plot_widget.addLegend(offset=(20, 20))
+        self.comp_legend = self.comp_plot_widget.addLegend(offset=(-12, -12))
+        self.comp_legend.anchor((1, 1), (1, 1), offset=(-12, -12))
+        self.comp_legend.setBrush(pg.mkBrush(255, 255, 255, 220))
+        self.comp_legend.setPen(pg.mkPen(BORDER))
         r_layout.addWidget(self.comp_plot_widget)
 
         layout.addWidget(right_box, 1)
@@ -4610,8 +4762,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _history_selection_changed(self):
         self.comp_plot_widget.clear()
-        if self.comp_plot_widget.plotItem.legend:
-            self.comp_plot_widget.plotItem.legend.clear()
+        self.comp_legend.clear()
 
         selected_rows = sorted(list({idx.row() for idx in self.history_table.selectedIndexes()}))
         if hasattr(self, "history_del_btn"):
@@ -4623,13 +4774,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if not selected_rows:
             return
 
-        specs = [
-            ("EfficiencyConverter_pct", "Converter Efficiency", "%"),
-            ("LossSystem_W", "System Loss", "W"),
-            ("Pout_W", "Output Power", "W"),
+        metric_index = self.comp_metric_combo.currentIndex()
+        metric_specs = [
+            ("Efficiency (%)", [
+                ("EfficiencyConverter_pct", "Converter", PLOT_CORE_BLUE),
+                ("EfficiencySystem_pct", "System", PLOT_SYSTEM_ORANGE),
+            ]),
+            ("Loss (W)", [
+                ("LossConverter_W", "Converter Loss", PLOT_CORE_BLUE),
+                ("LossSystem_W", "System Loss", PLOT_SYSTEM_ORANGE),
+            ]),
+            ("Power (W)", [
+                ("PinConverter_W", "Pin", PLOT_CORE_BLUE),
+                ("Pout_W", "Pout", PLOT_SYSTEM_ORANGE),
+                ("Paux_W", "Paux", PLOT_AUX_TEAL),
+            ]),
         ]
-        metric_key, title, unit = specs[self.comp_metric_combo.currentIndex()]
-        self.comp_plot_widget.setLabel("left", title, unit)
+        y_label, series_specs = metric_specs[metric_index]
+        self.comp_plot_widget.setLabel("left", y_label)
 
         all_xs: list[float] = []
         all_ys: list[float] = []
@@ -4647,22 +4809,40 @@ class MainWindow(QtWidgets.QMainWindow):
             vin = self.history_table.item(row, 5).text() if self.history_table.item(row, 5) else ""
             freq = self.history_table.item(row, 6).text() if self.history_table.item(row, 6) else ""
             mod = self.history_table.item(row, 7).text() if self.history_table.item(row, 7) else ""
-            label_name = f"{vin}V, {freq}Hz, {mod} ({short_id or run_id.split('-')[-1]})"
+            label_name = f"{vin} V, {freq}, {mod} ({short_id or run_id.split('-')[-1]})"
 
-            color = PALETTE[i % len(PALETTE)]
-            pairs = [(r.get("Iout_A"), r.get(metric_key)) for r in meas if isinstance(r.get("Iout_A"), (int, float)) and isinstance(r.get(metric_key), (int, float))]
-            if pairs:
-                xs = [p[0] for p in pairs]
-                ys = [p[1] for p in pairs]
+            valid_meas = [r for r in meas if r.get("Status") == "Valid"]
+            run_markers = ["o", "s", "t", "d", "+", "x", "star"]
+            marker = run_markers[i % len(run_markers)]
+            for field, series_name, base_color in series_specs:
+                pairs = [
+                    (r.get("Iout_A"), r.get(field)) for r in valid_meas
+                    if isinstance(r.get("Iout_A"), (int, float)) and isinstance(r.get(field), (int, float))
+                    and math.isfinite(float(r.get("Iout_A"))) and math.isfinite(float(r.get(field)))
+                ]
+                if not pairs:
+                    continue
+                color = QtGui.QColor(base_color)
+                if i > 0:
+                    color = color.lighter(100 + min(45, i * 12)) if i % 2 else color.darker(100 + min(35, i * 10))
+                xs = [float(p[0]) for p in pairs]
+                ys = [float(p[1]) for p in pairs]
                 all_xs.extend(xs)
-                all_ys.extend(ys)
-                self.comp_plot_widget.plot(xs, ys, pen=pg.mkPen(color, width=2.5), symbol="o", symbolBrush=color, symbolSize=7, name=label_name)
+                if metric_index == 0:
+                    all_ys.extend(y for x, y in zip(xs, ys) if x > 1e-6)
+                else:
+                    all_ys.extend(ys)
+                legend_name = series_name if len(selected_rows) == 1 else f"{series_name} · {short_id or run_id.split('-')[-1]}"
+                pen_comp = make_smooth_pen(color, width=2.2)
+                self.comp_plot_widget.plot(
+                    xs, ys, pen=pen_comp,
+                    symbol=marker, symbolBrush=color, symbolPen=pen_comp, symbolSize=7, name=legend_name,
+                )
 
         if all_xs:
             self.comp_plot_widget.setXRange(0.0, max(max(all_xs), 1.0), padding=0.04)
-            if self.comp_metric_combo.currentIndex() == 0:
-                y_min = min([0.0] + [y for y in all_ys if math.isfinite(y)])
-                y_max = max([100.0] + [y for y in all_ys if math.isfinite(y)])
+            if metric_index == 0:
+                y_min, y_max = efficiency_axis_bounds(all_ys)
                 self.comp_plot_widget.setYRange(y_min, y_max, padding=0.02)
             else:
                 self.comp_plot_widget.setYRange(min([0.0] + all_ys), max([1.0] + all_ys) * 1.1, padding=0.02)
@@ -4745,7 +4925,7 @@ class MainWindow(QtWidgets.QMainWindow):
         <ul>
             <li><b>Wait at each current:</b> Hard safety-bounded dwell time (s) load holds current. Total time per point in Continuous mode.</li>
             <li><b>Pulse ON time:</b> Hard safety-bounded pulse duration (s) load holds target current before turning OFF.</li>
-            <li><b>Measure last:</b> Duration (s) at the end of the dwell/pulse when acquisition starts (default: 1.5 s for 1.0 s PA window + 0.5 s VISA overhead). Pre-measurement settling time is <i>Wait − Measure last</i>.</li>
+            <li><b>Measure last:</b> Acquisition region inside the final 3 s of the total dwell/pulse ON interval. Pre-measurement settling time is <i>Wait or ON time − Measure last</i>.</li>
             <li><b>Readings to average:</b> Number of sequential snapshots averaged during the <i>Measure last</i> window (1 = single snapshot).</li>
             <li><b>Rest between pulses:</b> Cooldown duration (s) at 0 A between pulses.</li>
         </ul>
@@ -4836,24 +5016,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.load_card.cap_spin.setEnabled(not is_running)
             self.load_card.apply_cap_btn.setEnabled(not is_running)
 
-        # SET CURRENT controls (mode 0)
+        # SET/STEP CURRENT actions use one centralized priority/busy policy.
         direct_active = (not is_running and mode_id == 0)
-        self.btn_direct_zero.setEnabled(direct_active)  # ZERO / OFF is safety action and NEVER disabled
-        self.btn_direct_set.setEnabled(direct_active and not manual_busy)
-        for w in (self.manual_target_spin, self.direct_auto_delay, self.direct_auto_save,
-                  self.direct_auto_capture, self.manual_save_btn, self.manual_capture_btn, self.btn_adv_direct):
-            w.setEnabled(direct_active)
-
-        # STEP CURRENT controls (mode 1)
         step_active = (not is_running and mode_id == 1)
-        step_busy = self._manual_is_busy()
-        self.btn_step_zero.setEnabled(step_active)  # ZERO / OFF is safety action and NEVER disabled
-        self.btn_minus_step.setEnabled(step_active and not step_busy)
-        self.btn_plus_step.setEnabled(step_active and not step_busy)
+        self._update_current_action_enabled_state(is_running)
+        for w in (self.manual_target_spin, self.direct_auto_delay, self.direct_auto_save,
+                   self.direct_auto_capture, self.manual_save_btn, self.manual_capture_btn, self.btn_adv_direct):
+            w.setEnabled(direct_active)
+        self.manual_save_btn.setEnabled(direct_active and not self._manual_active_task)
+        self.manual_capture_btn.setEnabled(direct_active and not self._manual_active_task)
+
         for w in (self.manual_step_inc, self.manual_step_dec, self.step_auto_delay,
-                  self.step_auto_save, self.step_auto_capture,
-                  self.step_save_btn, self.step_capture_btn, self.btn_adv_step):
+                   self.step_auto_save, self.step_auto_capture,
+                   self.step_save_btn, self.step_capture_btn, self.btn_adv_step):
             w.setEnabled(step_active)
+        self.step_save_btn.setEnabled(step_active and not self._manual_active_task)
+        self.step_capture_btn.setEnabled(step_active and not self._manual_active_task)
 
         # CONTINUOUS controls (mode 2)
         cont_active = (not is_running and mode_id == 2)
@@ -4881,17 +5059,39 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.run_sweep_btn.setToolTip("Review parameters and begin automated sweep.")
 
+    def _update_current_action_enabled_state(self, is_running: bool | None = None):
+        """Apply the safety priority for all manual current-changing actions."""
+        if is_running is None:
+            is_running = (self.worker is not None and self.worker.isRunning()) or (self.demo_timer is not None and self.demo_timer.isActive())
+        mode_id = self.mode_group.checkedId()
+        direct_active = not is_running and mode_id == 0
+        step_active = not is_running and mode_id == 1
+        acquisition_busy = bool(self.point_action_busy)
+        command_busy = bool(self._manual_active_task) and not acquisition_busy
+        waiting = self._manual_countdown_timer.isActive()
+
+        self.btn_direct_zero.setEnabled(direct_active)
+        self.btn_step_zero.setEnabled(step_active)
+        self.btn_direct_set.setEnabled(direct_active and not acquisition_busy and not command_busy and not waiting)
+        self.btn_plus_step.setEnabled(step_active and not acquisition_busy and not command_busy and not waiting)
+        # A downward step may interrupt an upward acquisition, but not another
+        # zero/down hardware command that is already being dispatched.
+        self.btn_minus_step.setEnabled(step_active and not command_busy)
+
 
 
     # ----------------- SLOTS & CORE OPERATIONS -----------------
     def _store_for_source(self, source: str) -> WorkbookStore:
-        if getattr(self, "store", None) is not None:
-            return self.store
+        # Tests/tools may explicitly inject one standalone store. In normal GUI
+        # operation, however, source identity—not the currently selected mode—
+        # determines which workbook owns a run.
+        current_store = getattr(self, "store", None)
+        known_stores = {getattr(self, "hardware_store", None), getattr(self, "simulation_store", None)}
+        if current_store is not None and current_store not in known_stores:
+            return current_store
         return self.simulation_store if str(source).strip().lower() == "simulation" else self.hardware_store
 
     def _store_for_history_row(self, row: int) -> WorkbookStore:
-        if getattr(self, "store", None) is not None:
-            return self.store
         source_item = self.history_table.item(row, 4)
         return self._store_for_source(source_item.text() if source_item else "Hardware")
 
@@ -5038,6 +5238,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "live_act_lbl"):
                     self.live_act_lbl.setText(f"Actual: {current:.2f} A")
 
+    def _update_derived_kpis(self, record: dict[str, Any]) -> None:
+        """Update Pin/Pout/converter efficiency from one valid calculated point."""
+        if record.get("Status") != "Valid":
+            return
+        values = (
+            record.get("PinConverter_W"),
+            record.get("Pout_W"),
+            record.get("EfficiencyConverter_pct"),
+        )
+        if not all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in values):
+            return
+        pin, pout, efficiency = (float(value) for value in values)
+        self.kpi_labels["Pin"].setText(f"{pin:.2f} W")
+        self.kpi_labels["Pout"].setText(f"{pout:.2f} W")
+        self.kpi_labels["Eff"].setText(f"{efficiency:.2f}%")
+
     def _validate_current(self, amps: float, current_value: float | None = None) -> bool:
         cap = self.manual_mode_max_current() if hasattr(self, "manual_mode_max_current") else self.cap_val
         if amps < 0 or amps > cap:
@@ -5073,13 +5289,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _hardware_write_allowed(self) -> bool:
         return self.require_load_control_verified()
 
-    def _run_function(self, function: Callable[[], Any], success: Callable[[Any], None] | None = None):
+    def _run_function(self, function: Callable[[], Any], success: Callable[[Any], None] | None = None,
+                      failure: Callable[[str], None] | None = None):
         task = FunctionTask(function)
         if success: task.signals.success.connect(success)
-        task.signals.failure.connect(lambda error: QtWidgets.QMessageBox.warning(self, "Bench operation", error))
+        def on_failure(error: str):
+            if failure:
+                failure(error)
+            QtWidgets.QMessageBox.warning(self, "Bench operation", error)
+        task.signals.failure.connect(on_failure)
         QtCore.QThreadPool.globalInstance().start(task)
 
     def _manual_is_busy(self) -> bool:
+        if getattr(self, "point_action_busy", False):
+            return True
         if hasattr(self, "_manual_countdown_timer") and self._manual_countdown_timer.isActive():
             return True
         if getattr(self, "_manual_active_task", False):
@@ -5105,10 +5328,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 lbl.setStyleSheet(st)
 
     def _cancel_manual_automation(self, status_text: str = "READY", quiet: bool = False):
+        interrupted_store = self._manual_store
+        interrupted_pid = self._manual_point_id
+        interrupted_run_id = self._manual_run_id
+        invalidate_saved_point = bool(self.point_action_busy and self._manual_save_done and interrupted_store and interrupted_pid)
         if hasattr(self, "_manual_countdown_timer") and self._manual_countdown_timer.isActive():
             self._manual_countdown_timer.stop()
         self._manual_point_token += 1
         self._manual_remaining_ms = 0
+        self.point_action_busy = False
         self._manual_active_task = False
         if status_text.startswith("✓"):
             self._update_manual_status(status_text, "recorded")
@@ -5116,6 +5344,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_manual_status(status_text, "ready")
         else:
             self._update_manual_status(status_text, "ready")
+        self.update_enabled_states()
+        if invalidate_saved_point:
+            if self._manual_target_amps in self._manual_recorded_currents:
+                self._manual_recorded_currents.remove(self._manual_target_amps)
+            self._run_function(
+                lambda: interrupted_store.discard_interrupted_point(interrupted_pid, interrupted_run_id, "Interrupted by operator current reduction / LOAD OFF")
+            )
+
+    def _manual_action_failed(self, error: str, token: int):
+        if token != self._manual_point_token:
+            return
+        self._manual_active_task = False
+        self.point_action_busy = False
+        self._update_manual_status(f"Error: {error}", "error")
         self.update_enabled_states()
 
     def _cancel_step_automation(self, status_text: str = "READY", quiet: bool = False):
@@ -5178,6 +5420,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cancel_manual_automation("PREPARING", quiet=True)
         self._manual_point_token += 1
         current_token = self._manual_point_token
+        self.point_action_busy = True
         self._manual_step_action = step_action
         self._manual_target_amps = new_val
         self._manual_save_done = False
@@ -5189,6 +5432,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._manual_mode_name = mode_name
         self._manual_point_index += 1
         self._manual_point_id = point_id(self._manual_run_id, self._manual_point_index)
+        self.update_enabled_states()
 
         load = self.hub.instruments["load"]
         def cmd():
@@ -5218,7 +5462,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._manual_countdown_timer.start()
             self.update_enabled_states()
 
-        self._run_function(cmd, on_set_done)
+        self._run_function(cmd, on_set_done, lambda error: self._manual_action_failed(error, current_token))
 
     def _update_manual_status_countdown(self):
         sec = max(0.0, self._manual_remaining_ms / 1000.0)
@@ -5263,6 +5507,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "_manual_countdown_timer") and self._manual_countdown_timer.isActive():
             self._manual_countdown_timer.stop()
 
+        self.point_action_busy = True
         self._manual_active_task = True
         self._update_manual_status("SAVING READING", "saving")
         self.update_enabled_states()
@@ -5270,9 +5515,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             settings = self._collect_settings(manual=True)
         except Exception as exc:
-            self._manual_active_task = False
-            self._update_manual_status(f"Error: {exc}", "error")
-            self.update_enabled_states()
+            self._manual_action_failed(str(exc), token)
             return
 
         run_id = self._manual_run_id or settings["run_id"]
@@ -5287,7 +5530,6 @@ class MainWindow(QtWidgets.QMainWindow):
         supersede = self._manual_save_done  # If already saved for this point instance, supersede!
 
         def task():
-            store.create_run(run_rec)
             pa = self.hub.instruments["pa"].read_snapshot()
             load = self.hub.instruments["load"].read_snapshot(include_voltage=False)
             try:
@@ -5296,6 +5538,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 psu = None
             if token != self._manual_point_token:
                 return {}
+            store.create_run(run_rec)
             derived, warnings = calculate_measurement(pa, load, psu, settings["supply_channels"])
             record = {
                 "PointID": pid,
@@ -5318,8 +5561,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return record
 
         def on_done(record: dict[str, Any]):
-            if token != self._manual_point_token or not record:
-                self._manual_active_task = False
+            if token != self._manual_point_token:
+                if record:
+                    self._run_function(lambda: store.discard_interrupted_point(pid, run_id, "Interrupted by operator current reduction / LOAD OFF"))
+                return
+            if not record:
+                self._manual_action_failed("Measurement was cancelled before it could be saved", token)
                 return
             self._manual_active_task = False
             self._manual_save_done = True
@@ -5337,7 +5584,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._manual_point_completed()
 
-        self._run_function(task, on_done)
+        self._run_function(task, on_done, lambda error: self._manual_action_failed(error, token))
 
     def _execute_step_measurement(self, is_auto: bool = True, token: int | None = None):
         self._execute_manual_measurement(is_auto, token)
@@ -5348,6 +5595,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "_manual_countdown_timer") and self._manual_countdown_timer.isActive():
             self._manual_countdown_timer.stop()
 
+        self.point_action_busy = True
         self._manual_active_task = True
         self._update_manual_status("CAPTURING SCOPE", "saving")
         self.update_enabled_states()
@@ -5355,9 +5603,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             settings = self._collect_settings(manual=True)
         except Exception as exc:
-            self._manual_active_task = False
-            self._update_manual_status(f"Error: {exc}", "error")
-            self.update_enabled_states()
+            self._manual_action_failed(str(exc), token)
             return
 
         run_id = self._manual_run_id or settings["run_id"]
@@ -5368,7 +5614,7 @@ class MainWindow(QtWidgets.QMainWindow):
         run_rec["ModulationLabel"] = self._manual_base_campaign or settings["modulation"]
         store = self._store_for_source(settings["data_source"])
         pid = self._manual_point_id or point_id(run_id, 0)
-        capture_dir = store.path.parent / "captures" / settings["data_source"].lower()
+        capture_dir = capture_root_for_source(store.path, settings["data_source"])
         capture_dir.mkdir(parents=True, exist_ok=True)
         png = capture_dir / f"{pid}.png"
         csv_f = capture_dir / f"{pid}.csv"
@@ -5377,7 +5623,6 @@ class MainWindow(QtWidgets.QMainWindow):
         def task():
             if token != self._manual_point_token:
                 return {}
-            store.create_run(run_rec)
             status, error = "Captured", ""
             try:
                 self.hub.instruments["scope"].capture(png, csv_f)
@@ -5391,6 +5636,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if artifact.exists():
                         artifact.unlink()
                 return {}
+            store.create_run(run_rec)
             record = {
                 "PointID": pid,
                 "RunID": run_id,
@@ -5418,8 +5664,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return record
 
         def on_done(record: dict[str, Any]):
-            if token != self._manual_point_token or not record:
-                self._manual_active_task = False
+            if token != self._manual_point_token:
+                if record:
+                    self._run_function(lambda: store.discard_interrupted_point(pid, run_id, "Interrupted by operator current reduction / LOAD OFF"))
+                return
+            if not record:
+                self._manual_action_failed("Scope capture was cancelled", token)
                 return
             self._manual_active_task = False
             self._manual_capture_done = True
@@ -5436,13 +5686,14 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._manual_point_completed()
 
-        self._run_function(task, on_done)
+        self._run_function(task, on_done, lambda error: self._manual_action_failed(error, token))
 
     def _execute_step_capture(self, is_auto: bool = True, token: int | None = None):
         self._execute_manual_capture(is_auto, token)
 
     def _manual_point_completed(self):
         self._manual_active_task = False
+        self.point_action_busy = False
         amps = self._manual_target_amps if self._manual_target_amps > 0 else self.manual_current.value()
         if amps > 0 and (self._manual_step_action == "ascending_measurement" or self._manual_mode_name == "Set Current"):
             self._update_manual_status(f"✓ RECORDED · {amps:.2f} A", "recorded")
@@ -5515,16 +5766,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.step_present_lbl.setText("0.00 A · OFF")
             self.step_present_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
             self._manual_active_task = True
+            safety_token = self._manual_point_token
             def cmd():
                 load = self.hub.instruments["load"]
-                load.set_current(0.0)
-                load.set_input(False)
+                load.safe_off()
             def on_done(_):
                 self._manual_active_task = False
                 self.statusBar().showMessage("Load set to 0.00 A · OFF")
                 self._update_manual_status("READY", "ready")
                 self.update_enabled_states()
-            self._run_function(cmd, on_done)
+            self._run_function(cmd, on_done, lambda error: self._manual_action_failed(error, safety_token))
         else:
             if not self.require_load_control_verified("Set Current") or not self._validate_current(amps, current_value=self._manual_target_current):
                 return
@@ -5549,16 +5800,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.step_present_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
         self._update_manual_status("READY", "ready")
         self._manual_active_task = True
+        safety_token = self._manual_point_token
         load = self.hub.instruments["load"]
         def cmd():
-            load.set_current(0.0)
-            load.set_input(False)
+            load.safe_off()
         def on_done(_):
             self._manual_active_task = False
             self.statusBar().showMessage("Load zeroed (0.00 A · OFF)")
             self._update_manual_status("READY", "ready")
             self.update_enabled_states()
-        self._run_function(cmd, on_done)
+        self._run_function(cmd, on_done, lambda error: self._manual_action_failed(error, safety_token))
 
     def _step_delta(self, direction: int):
         max_safe = self.manual_mode_max_current()
@@ -5596,15 +5847,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.step_present_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
                 self._update_manual_status("READY", "ready")
                 self._manual_active_task = True
+                safety_token = self._manual_point_token
                 def cmd_zero():
-                    load.set_current(0.0)
-                    load.set_input(False)
+                    load.safe_off()
                 def on_zero_done(_):
                     self._manual_active_task = False
                     self.statusBar().showMessage("Load stepped to 0.00 A · OFF")
                     self._update_manual_status("READY", "ready")
                     self.update_enabled_states()
-                self._run_function(cmd_zero, on_zero_done)
+                self._run_function(cmd_zero, on_zero_done, lambda error: self._manual_action_failed(error, safety_token))
                 return
 
             if not self.require_load_control_verified("Step Current") or not self._validate_current(new_val, current_value=self._manual_target_current):
@@ -5616,6 +5867,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_manual_status(f"RAMPING DOWN · {new_val:.2f} A", "settling")
             self.update_enabled_states()
             self._manual_active_task = True
+            safety_token = self._manual_point_token
             def cmd_down():
                 load.set_current(new_val)
                 load.set_input(True)
@@ -5624,7 +5876,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(f"Load stepped down to {new_val:g} A · ON")
                 self._update_manual_status(f"READY · {new_val:.2f} A", "ready")
                 self.update_enabled_states()
-            self._run_function(cmd_down, on_down_done)
+            self._run_function(cmd_down, on_down_done, lambda error: self._manual_action_failed(error, safety_token))
 
     def _manual_set(self):
         self._manual_direct_set()
@@ -5749,7 +6001,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         run_id = new_run_id(campaign)
-        fpga_status, fpga_data, fpga_warning = (fpga_snapshot(Path(self.config["fpga_root"]), self.frequency.value()) if self.fpga_check.isChecked() else ("Unavailable", {}, "Skipped by operator"))
+        frequency_hz = self.frequency_hz()
+        fpga_status, fpga_data, fpga_warning = (fpga_snapshot(Path(self.config["fpga_root"]), frequency_hz) if self.fpga_check.isChecked() else ("Unavailable", {}, "Skipped by operator"))
         data_source = "Simulation" if self.simulation.isChecked() else "Hardware"
         identities = {key: getattr(inst, "identity", "") for key, inst in self.hub.instruments.items()}
         supply_json = [asdict(channel) for channel in channels]
@@ -5760,7 +6013,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         run_record = {
             "RunID": run_id, "CampaignName": campaign, "Created": utc_now(), "Status": "Aborted", "DataSource": data_source, "Mode": mode,
-            "VinTarget_V": self.vin_target.value(), "ModulationLabel": base_campaign, "Frequency_Hz": self.frequency.value(),
+            "VinTarget_V": self.vin_target.value(), "ModulationLabel": base_campaign, "Frequency_Hz": frequency_hz,
             "ModulationMetadata": "",
             "AuxA_Included": aux_a_inc, "AuxB_Included": aux_b_inc, "AuxC_Included": aux_c_inc,
             "SupplyConfiguration": supply_json,
@@ -5772,7 +6025,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "run_id": run_id, "run_record": run_record, "points": points, "capture_points": capture_points,
             "mode": mode, "settle": settle, "dwell": dwell, "sample_window": s_win, "sample_count": s_cnt,
             "cooldown": cooldown, "working_cap": cap, "vin_target": self.vin_target.value(),
-            "modulation": base_campaign, "frequency": self.frequency.value(),
+            "modulation": base_campaign, "frequency": frequency_hz,
             "supply_channels": channels, "psu_required": psu_req,
             "data_source": data_source, "duplicate_action": "keep",
             "return_to_zero_step": return_step,
@@ -5845,7 +6098,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.config["campaign_name"] = self.test_name.text()
         self.config["vin_target_v"] = self.vin_target.value()
-        self.config["frequency_hz"] = self.frequency.value()
+        self.config["frequency_hz"] = self.frequency_hz()
         save_config(self.config)
 
         self.run_strip.setVisible(True)
@@ -5859,6 +6112,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.plot_rows.clear()
         self.live_curve.setData([], [])
+        self.live_system_curve.setData([], [])
+        self.live_aux_curve.setData([], [])
         self.strip_label.setText(f"Status: RUNNING")
         self.strip_label.setStyleSheet(f"color: {SUCCESS_GREEN}; font-weight: 800; font-size: 13px;")
         self.stop_sweep_btn.setText("■  STOP & RETURN TO ZERO")
@@ -5962,13 +6217,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.kpi_labels["Iin"].setText("0.000 A" if abs(iin_val) < 0.0005 else f"{iin_val:.3f} A")
         if isinstance(record.get("Vout_V"), (int, float)):
             self.kpi_labels["Vout"].setText(f"{record['Vout_V']:.2f} V")
-        if isinstance(record.get("EfficiencyConverter_pct"), (int, float)):
-            self.kpi_labels["Eff"].setText(f"{record['EfficiencyConverter_pct']:.2f}%")
         if isinstance(record.get("Iout_A"), (int, float)):
             iout_val = record["Iout_A"]
             self.kpi_labels["Iout"].setText(f"{iout_val:.2f} A · ON" if iout_val > 0.001 else "0.00 A · OFF")
             if hasattr(self, "live_act_lbl"):
                 self.live_act_lbl.setText(f"Actual: {iout_val:.2f} A")
+        self._update_derived_kpis(record)
         record_store = self._store_for_source(record.get("DataSource", "Hardware"))
         if record_store.last_warning:
             self.statusBar().showMessage(record_store.last_warning)
@@ -5999,6 +6253,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.demo_index = 0
         self.plot_rows.clear()
         self.live_curve.setData([], [])
+        self.live_system_curve.setData([], [])
+        self.live_aux_curve.setData([], [])
         self.tabs.setCurrentIndex(1)  # Switch to Run tab
         self.run_strip.setVisible(True)
         self.strip_label.setText("SIMULATION DEMO: Generic converter profile")
@@ -6040,7 +6296,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.kpi_labels["Iin"].setText(f"{pin / vin:.3f} A" if amps > 0 else "0.000 A")
         self.kpi_labels["Vout"].setText(f"{vout:.2f} V")
         self.kpi_labels["Iout"].setText(f"{amps:.2f} A · ON" if amps > 0 else "0.00 A · OFF")
-        self.kpi_labels["Eff"].setText(f"{eff:.2f} %" if amps > 0 else "—")
 
     def _demo_completed(self, status: str):
         self.strip_label.setText(f"DEMO COMPLETED ({status})")
@@ -6095,7 +6350,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ("Status", str(run.get("Status", ""))),
                 ("DataSource", str(run.get("DataSource", ""))),
                 ("VinTarget_V", str(run.get("VinTarget_V", ""))),
-                ("Frequency_Hz", str(run.get("Frequency_Hz", ""))),
+                ("Frequency_Hz", format_frequency_khz(run.get("Frequency_Hz"))),
                 ("ModulationLabel", str(run.get("ModulationLabel", ""))),
                 ("Mode", str(run.get("Mode", ""))),
             )
@@ -6148,50 +6403,42 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Delete Runs", f"Error reading workbook: {exc}")
             return
 
-        # Pre-verify existence
+        # Runs sheet is authoritative. A stale UI row is harmless: refresh it and
+        # idempotently remove any orphan measurements/capture references.
         matching_runs_map = {str(r.get("RunID", "")).strip(): r for r in runs if str(r.get("RunID", "")).strip() in selected_run_ids}
+        matching_runs = [matching_runs_map[rid] for rid in selected_run_ids if rid in matching_runs_map]
 
-        for rid in selected_run_ids:
-            if rid not in matching_runs_map:
-                QtWidgets.QMessageBox.warning(self, "Delete Runs", f"Run {rid} no longer exists. Refresh History.")
+        def delete_selected() -> bool:
+            try:
+                grouped: dict[WorkbookStore, list[str]] = {}
+                for rid in selected_run_ids:
+                    grouped.setdefault(store_map[rid], []).append(rid)
+                for selected_store, run_ids in grouped.items():
+                    selected_store.delete_runs(run_ids)
+            except Exception as del_err:
+                QtWidgets.QMessageBox.critical(self, "Delete Runs Error", str(del_err))
                 self._load_history()
-                return
+                return False
+            self._load_history()
+            self._history_selection_changed()
+            self.history_table.clearSelection()
+            return True
 
-        matching_runs = [matching_runs_map[rid] for rid in selected_run_ids]
-
-        if len(selected_run_ids) == 1:
-            run_rec = matching_runs[0]
-            dialog = DeleteRunDialog(run_rec, self)
+        if not matching_runs:
+            if delete_selected():
+                self.statusBar().showMessage("Selected run was already removed; History refreshed")
+        elif len(selected_run_ids) == 1:
+            dialog = DeleteRunDialog(matching_runs[0], self)
             if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-                try:
-                    store_map[selected_run_ids[0]].delete_run(selected_run_ids[0])
-                except Exception as del_err:
-                    QtWidgets.QMessageBox.critical(self, "Delete Run Error", str(del_err))
-                    self._load_history()
-                    return
-                self._load_history()
-                self._history_selection_changed()
-                self.history_table.clearSelection()
-                short_str = short_id_map.get(selected_run_ids[0], selected_run_ids[0])
-                self.statusBar().showMessage(f"Permanently deleted run {short_str}")
+                if delete_selected():
+                    short_str = short_id_map.get(selected_run_ids[0], selected_run_ids[0])
+                    self.statusBar().showMessage(f"Permanently deleted run {short_str}")
         else:
             # Multi-run batch
             dialog = DeleteBatchRunsDialog(matching_runs, self)
             if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-                try:
-                    grouped: dict[WorkbookStore, list[str]] = {}
-                    for rid in selected_run_ids:
-                        grouped.setdefault(store_map[rid], []).append(rid)
-                    for store, run_ids in grouped.items():
-                        store.delete_runs(run_ids)
-                except Exception as del_err:
-                    QtWidgets.QMessageBox.critical(self, "Delete Runs Error", str(del_err))
-                    self._load_history()
-                    return
-                self._load_history()
-                self._history_selection_changed()
-                self.history_table.clearSelection()
-                self.statusBar().showMessage(f"Permanently deleted {len(selected_run_ids)} runs")
+                if delete_selected():
+                    self.statusBar().showMessage(f"Permanently deleted {len(selected_run_ids)} runs")
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         app = QtWidgets.QApplication.instance()
@@ -6211,6 +6458,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents()
         self._finalize_manual_session("Application closed", status_override="Stopped")
         self.hub.safe_shutdown()
+        self.config["frequency_hz"] = self.frequency_hz()
         save_config(self.config)
         event.accept()
 
