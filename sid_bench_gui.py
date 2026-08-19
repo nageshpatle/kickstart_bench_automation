@@ -88,6 +88,50 @@ PALETTE = [
 ]
 
 
+def plot_metric_series(
+    plot_widget: pg.PlotWidget,
+    xs: list[float] | None = None,
+    ys: list[float] | None = None,
+    color: Any = PLOT_CORE_BLUE,
+    name: str = "",
+    symbol: str = "o",
+    symbol_size: int = 6,
+) -> pg.PlotDataItem:
+    """Plot a metric series with polished rounded pens, solid line styling, and matching marker colors."""
+    xs = xs if xs is not None else []
+    ys = ys if ys is not None else []
+    pen = make_smooth_pen(color, width=2.2)
+    return plot_widget.plot(
+        xs,
+        ys,
+        pen=pen,
+        symbol=symbol,
+        symbolSize=symbol_size,
+        symbolBrush=pg.mkBrush(color),
+        symbolPen=pg.mkPen(color, width=1),
+        name=name,
+    )
+
+
+def apply_metric_curve_style(
+    curve: pg.PlotDataItem,
+    color: Any,
+    symbol: str = "o",
+    symbol_size: int = 6,
+    name: str = "",
+) -> pg.PlotDataItem:
+    """Apply consistent smooth pen and matching marker styling to an existing PlotDataItem."""
+    pen = make_smooth_pen(color, width=2.2)
+    curve.setPen(pen)
+    curve.setSymbol(symbol)
+    curve.setSymbolSize(symbol_size)
+    curve.setSymbolBrush(pg.mkBrush(color))
+    curve.setSymbolPen(pg.mkPen(color, width=1))
+    if name:
+        curve.opts["name"] = name
+    return curve
+
+
 def apply_forced_light_theme(app: QtWidgets.QApplication):
     """Apply a complete light palette, independent of the OS color scheme."""
     app.setStyle("Fusion")
@@ -4389,21 +4433,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_legend.anchor((1, 1), (1, 1), offset=(-12, -12))
         self.live_legend.setBrush(pg.mkBrush(255, 255, 255, 220))
         self.live_legend.setPen(pg.mkPen(BORDER))
-        pen_core = make_smooth_pen(PLOT_CORE_BLUE, width=2.2)
-        pen_system = make_smooth_pen(PLOT_SYSTEM_ORANGE, width=2.2)
-        pen_aux = make_smooth_pen(PLOT_AUX_TEAL, width=2.2)
-
-        self.live_curve = self.live_plot_widget.plot(
-            [], [], pen=pen_core, symbol="o", symbolBrush=PLOT_CORE_BLUE, symbolPen=pen_core,
-            symbolSize=7,
+        self.live_curve = plot_metric_series(
+            self.live_plot_widget, [], [], PLOT_CORE_BLUE, name="Converter", symbol="o", symbol_size=6
         )
-        self.live_system_curve = self.live_plot_widget.plot(
-            [], [], pen=pen_system,
-            symbol="s", symbolBrush=PLOT_SYSTEM_ORANGE, symbolPen=pen_system, symbolSize=7,
+        self.live_system_curve = plot_metric_series(
+            self.live_plot_widget, [], [], PLOT_SYSTEM_ORANGE, name="System", symbol="o", symbol_size=6
         )
-        self.live_aux_curve = self.live_plot_widget.plot(
-            [], [], pen=pen_aux,
-            symbol="t", symbolBrush=PLOT_AUX_TEAL, symbolPen=pen_aux, symbolSize=7,
+        self.live_aux_curve = plot_metric_series(
+            self.live_plot_widget, [], [], PLOT_AUX_TEAL, name="Paux", symbol="o", symbol_size=6
         )
 
         # Centered Watermark Overlay on Plot Canvas (Translucent Orange)
@@ -4611,17 +4648,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _switch_live_plot(self, index: int):
         metric_specs = [
             ("Efficiency (%)", [
-                ("EfficiencyConverter_pct", "Converter"),
-                ("EfficiencySystem_pct", "System"),
+                ("EfficiencyConverter_pct", "Converter", PLOT_CORE_BLUE),
+                ("EfficiencySystem_pct", "System", PLOT_SYSTEM_ORANGE),
             ]),
             ("Loss (W)", [
-                ("LossConverter_W", "Converter Loss"),
-                ("LossSystem_W", "System Loss"),
+                ("LossConverter_W", "Converter Loss", PLOT_CORE_BLUE),
+                ("LossSystem_W", "System Loss", PLOT_SYSTEM_ORANGE),
             ]),
             ("Power (W)", [
-                ("PinConverter_W", "Pin"),
-                ("Pout_W", "Pout"),
-                ("Paux_W", "Paux"),
+                ("PinConverter_W", "Pin", PLOT_CORE_BLUE),
+                ("Pout_W", "Pout", PLOT_SYSTEM_ORANGE),
+                ("Paux_W", "Paux", PLOT_AUX_TEAL),
             ]),
         ]
         y_label, series_specs = metric_specs[index]
@@ -4636,13 +4673,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if curve_index >= len(series_specs):
                 curve.setData([], [])
                 continue
-            field, legend_name = series_specs[curve_index]
+            field, legend_name, base_color = series_specs[curve_index]
             pairs = [
                 (row.get("Iout_A"), row.get(field)) for row in self.plot_rows
                 if row.get("Status") == "Valid" and isinstance(row.get("Iout_A"), (int, float))
                 and isinstance(row.get(field), (int, float))
                 and math.isfinite(float(row.get("Iout_A"))) and math.isfinite(float(row.get(field)))
             ]
+            apply_metric_curve_style(curve, base_color, symbol="o", symbol_size=6, name=legend_name)
             curve.setData([p[0] for p in pairs], [p[1] for p in pairs])
             self.live_legend.addItem(curve, legend_name)
             xs.extend(float(p[0]) for p in pairs)
@@ -4813,7 +4851,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             valid_meas = [r for r in meas if r.get("Status") == "Valid"]
             run_markers = ["o", "s", "t", "d", "+", "x", "star"]
-            marker = run_markers[i % len(run_markers)]
+            marker = "o" if len(selected_rows) == 1 else run_markers[i % len(run_markers)]
             for field, series_name, base_color in series_specs:
                 pairs = [
                     (r.get("Iout_A"), r.get(field)) for r in valid_meas
@@ -4833,10 +4871,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     all_ys.extend(ys)
                 legend_name = series_name if len(selected_rows) == 1 else f"{series_name} · {short_id or run_id.split('-')[-1]}"
-                pen_comp = make_smooth_pen(color, width=2.2)
-                self.comp_plot_widget.plot(
-                    xs, ys, pen=pen_comp,
-                    symbol=marker, symbolBrush=color, symbolPen=pen_comp, symbolSize=7, name=legend_name,
+                plot_metric_series(
+                    self.comp_plot_widget,
+                    xs,
+                    ys,
+                    color=color,
+                    name=legend_name,
+                    symbol=marker,
+                    symbol_size=6,
                 )
 
         if all_xs:

@@ -19,12 +19,18 @@ from sid_instruments import InstrumentHub, InstrumentSnapshot, SupplyChannel, Vi
 def clean_qt_state(tmp_path, monkeypatch):
     # No GUI test may ever touch the operator's configured campaign workbook.
     monkeypatch.setenv("KICKSTART_WORKBOOK_PATH", str(tmp_path / "pytest_campaign.xlsx"))
+    config_file = Path(__file__).resolve().parent / "bench_config.json"
+    orig_config = config_file.read_text(encoding="utf-8") if config_file.exists() else None
     yield
+    if orig_config is not None and config_file.exists():
+        try:
+            config_file.write_text(orig_config, encoding="utf-8")
+        except Exception:
+            pass
     try:
         from PyQt6 import QtCore, QtWidgets
         app = QtWidgets.QApplication.instance()
         if app is not None:
-            app.processEvents()
             pool = QtCore.QThreadPool.globalInstance()
             if pool is not None:
                 pool.waitForDone(1000)
@@ -3926,12 +3932,15 @@ def test_chroma_63206a_scpi_commands_bench_diagnostics_and_run_behavior(tmp_path
 
 
 def test_plot_visual_smoothness_and_pen_styling():
-    """Verify pyqtgraph antialiasing, round cap/join pens, 7px markers, and discrete linear data handling."""
+    """Verify pyqtgraph antialiasing, round cap/join pens, 6px circular markers, matching colors, and discrete linear data handling."""
     import os
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     from PyQt6 import QtWidgets, QtCore, QtGui
     import pyqtgraph as pg
-    from sid_bench_gui import MainWindow, make_smooth_pen, PLOT_CORE_BLUE, PLOT_SYSTEM_ORANGE, PLOT_AUX_TEAL
+    from sid_bench_gui import (
+        MainWindow, make_smooth_pen, plot_metric_series, apply_metric_curve_style,
+        PLOT_CORE_BLUE, PLOT_SYSTEM_ORANGE, PLOT_AUX_TEAL
+    )
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
 
@@ -3945,19 +3954,34 @@ def test_plot_visual_smoothness_and_pen_styling():
     assert pen.capStyle() == QtCore.Qt.PenCapStyle.RoundCap
     assert pen.joinStyle() == QtCore.Qt.PenJoinStyle.RoundJoin
 
-    # 3. Live plot curves styling: ~2.2px width, ~7px markers, solid filled symbols
+    # 3. plot_metric_series helper creates styled PlotDataItem
+    pw = pg.PlotWidget(background="w")
+    test_item = plot_metric_series(pw, [1.0, 2.0], [10.0, 20.0], color=PLOT_CORE_BLUE, name="Test", symbol="o", symbol_size=6)
+    assert test_item.opts["symbol"] == "o"
+    assert test_item.opts["symbolSize"] == 6
+    assert test_item.opts["symbolBrush"].color().name().lower() == PLOT_CORE_BLUE.lower()
+    assert test_item.opts["symbolPen"].color().name().lower() == PLOT_CORE_BLUE.lower()
+    assert test_item.opts["pen"].color().name().lower() == PLOT_CORE_BLUE.lower()
+
+    # 4. Live plot curves styling: ~2.2px width, 6px circular markers ("o"), matching colors
     window = MainWindow()
-    curves = [window.live_curve, window.live_system_curve, window.live_aux_curve]
-    for curve in curves:
+    curves = [
+        (window.live_curve, PLOT_CORE_BLUE),
+        (window.live_system_curve, PLOT_SYSTEM_ORANGE),
+        (window.live_aux_curve, PLOT_AUX_TEAL),
+    ]
+    for curve, expected_color in curves:
         c_pen = curve.opts["pen"]
         assert isinstance(c_pen, QtGui.QPen)
         assert abs(c_pen.widthF() - 2.2) < 1e-4
         assert c_pen.capStyle() == QtCore.Qt.PenCapStyle.RoundCap
         assert c_pen.joinStyle() == QtCore.Qt.PenJoinStyle.RoundJoin
-        assert curve.opts["symbolSize"] == 7
-        assert curve.opts["symbol"] in ("o", "s", "t")
+        assert curve.opts["symbolSize"] == 6
+        assert curve.opts["symbol"] == "o"
+        assert curve.opts["symbolBrush"].color().name().lower() == expected_color.lower()
+        assert curve.opts["symbolPen"].color().name().lower() == expected_color.lower()
 
-    # 4. Discrete straight lines without interpolation
+    # 5. Discrete straight lines without interpolation
     test_points = [
         {"Status": "Valid", "Iout_A": 5.0, "EfficiencyConverter_pct": 94.2, "EfficiencySystem_pct": 92.1},
         {"Status": "Valid", "Iout_A": 15.0, "EfficiencyConverter_pct": 96.8, "EfficiencySystem_pct": 95.0},
@@ -3974,5 +3998,13 @@ def test_plot_visual_smoothness_and_pen_styling():
     sys_xs, sys_ys = window.live_system_curve.getData()
     assert list(sys_xs) == [5.0, 15.0, 25.0]
     assert list(sys_ys) == [92.1, 95.0, 93.8]
+
+    # Verify switching metric views maintains exact matching colors and 6px circular markers
+    window._switch_live_plot(2)  # Power (W)
+    assert window.live_curve.opts["symbol"] == "o"
+    assert window.live_curve.opts["symbolSize"] == 6
+    assert window.live_curve.opts["symbolBrush"].color().name().lower() == PLOT_CORE_BLUE.lower()
+    assert window.live_system_curve.opts["symbolBrush"].color().name().lower() == PLOT_SYSTEM_ORANGE.lower()
+    assert window.live_aux_curve.opts["symbolBrush"].color().name().lower() == PLOT_AUX_TEAL.lower()
 
     window.close()
