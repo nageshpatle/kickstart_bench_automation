@@ -178,6 +178,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "schema": 5,
     "campaign_name": "Efficiency Test",
     "working_current_cap_a": 70.0,
+    "vin_safety_enabled": True,
     "last_modulation_label": "",
     "recent_modulations": [],
     "workbooks": {
@@ -369,6 +370,38 @@ def parse_capture_points(text: str) -> set[float]:
             except ValueError as exc:
                 raise ValueError(f"Invalid scope capture current: '{token}'") from exc
     return pts
+
+
+def check_vin_safety(
+    measured_vin: float,
+    target_vin: float,
+    enabled: bool = True,
+) -> tuple[bool, str]:
+    """Evaluate whether measured Vin is within ±10% of target_vin.
+
+    Returns:
+        tuple[bool, str]: (is_safe, fault_description)
+    """
+    if not enabled:
+        return True, ""
+    if not isinstance(target_vin, (int, float)) or target_vin <= 0:
+        return True, ""
+    if not isinstance(measured_vin, (int, float)) or not math.isfinite(float(measured_vin)):
+        return True, ""
+
+    low = 0.90 * float(target_vin)
+    high = 1.10 * float(target_vin)
+
+    # Floating-point safe comparison: allowing exact boundary with 1e-6 epsilon tolerance
+    if float(measured_vin) < low - 1e-6 or float(measured_vin) > high + 1e-6:
+        desc = (
+            f"Target Vin: {target_vin:.1f} V\n"
+            f"Measured Vin: {measured_vin:.1f} V\n"
+            f"Allowed range: {low:.1f}–{high:.1f} V"
+        )
+        return False, desc
+    return True, ""
+
 
 
 
@@ -1873,6 +1906,16 @@ class LoadCard(QtWidgets.QGroupBox):
         self.chk_load.setStyleSheet("font-size: 11px; font-weight: 600; color: #78350F; margin-top: 4px;")
         sb_lay.addWidget(self.chk_load)
 
+        self.chk_vin_safety = QtWidgets.QCheckBox("Auto LOAD OFF if Vin is outside ±10% of Target")
+        self.chk_vin_safety.setToolTip("During hardware measurements, automatically turns the electronic load OFF and aborts the run if measured Vin falls below 90% or rises above 110% of Target Vin.")
+        self.chk_vin_safety.setStyleSheet("font-size: 11px; font-weight: 600; color: #78350F; margin-top: 2px;")
+        self.chk_vin_safety.setChecked(bool(self.config.get("vin_safety_enabled", True)))
+        def _on_vin_safety_toggled(checked: bool):
+            self.config["vin_safety_enabled"] = checked
+            self.save_callback()
+        self.chk_vin_safety.toggled.connect(_on_vin_safety_toggled)
+        sb_lay.addWidget(self.chk_vin_safety)
+
         layout.addWidget(safety_box)
         layout.addStretch()
 
@@ -2644,6 +2687,7 @@ class SweepWorker(QtCore.QThread):
     measurement = QtCore.pyqtSignal(dict)
     completed = QtCore.pyqtSignal(str, str)
     warning = QtCore.pyqtSignal(str)
+    vin_safety_tripped = QtCore.pyqtSignal(float, float)
 
     def __init__(self, hub: InstrumentHub, store: WorkbookStore, settings: dict[str, Any]):
         super().__init__()
@@ -2807,6 +2851,24 @@ class SweepWorker(QtCore.QThread):
 
                 # Execute measurement near the end of the dwell
                 pa_snap, load_snap, psu_snap = self._measure_average(self.settings["sample_count"], measure_last)
+
+                # Evaluate Vin safety shutdown before processing/saving the point
+                pa_vin = pa_snap.values.get("vin") if pa_snap and pa_snap.valid else None
+                if pa_vin is not None and isinstance(pa_vin, (int, float)) and math.isfinite(float(pa_vin)):
+                    is_safe, vin_fault_desc = check_vin_safety(
+                        float(pa_vin),
+                        float(self.settings.get("vin_target", 0.0)),
+                        self.settings.get("vin_safety_enabled", True),
+                    )
+                    if not is_safe:
+                        load.safe_off()
+                        last_commanded_amps = 0.0
+                        self.abort_event.set()
+                        self.vin_safety_tripped.emit(float(self.settings.get("vin_target", 0.0)), float(pa_vin))
+                        status = "Aborted"
+                        warnings.append(f"Vin safety shutdown; {vin_fault_desc.replace(chr(10), '; ')}")
+                        break
+
                 derived, point_warnings = calculate_measurement(pa_snap, load_snap, psu_snap, self.settings["supply_channels"])
 
                 pid = point_id(run_id, index)
@@ -2863,6 +2925,8 @@ class SweepWorker(QtCore.QThread):
             if self.stop_event.is_set():
                 status = "Stopped"
                 warnings.append("Stopped by operator; returned to 0 A")
+            elif status == "Aborted":
+                pass
             elif any_invalid:
                 status = "Invalid"
             else:
@@ -3450,6 +3514,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_card.cap_applied.connect(self._on_safety_limit_applied)
         self.chk_load = self.load_card.chk_load
         self.chk_load.toggled.connect(lambda _: self.update_enabled_states())
+        self.chk_vin_safety = self.load_card.chk_vin_safety
 
         self.supply_card = SupplyCard(self.hub, self.config, lambda: save_config(self.config))
         self.scope_card = ScopeCard(
@@ -4977,6 +5042,7 @@ class MainWindow(QtWidgets.QMainWindow):
         <h3>Instrument Sessions & Safety</h3>
         <ul>
             <li><b>LOAD OFF / Emergency Stop:</b> Immediately commands the electronic load OFF and aborts active sweeps. Shortcut: <b>Esc</b>.</li>
+            <li><b>Vin Safety Shutdown:</b> When enabled in Bench Setup, automatically turns the electronic load OFF and aborts active runs if measured Vin falls outside ±10% of Target Vin. <i>Note: Vin safety shutdown is evaluated from PA measurements and therefore is not instantaneous hardware protection. It is intended to prevent the load from remaining active after a major input-voltage abnormality.</i></li>
             <li><b>Thermal Checks:</b> Infrared / thermal camera verification remains the operator's responsibility.</li>
         </ul>
         """)
@@ -5582,6 +5648,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 psu = None
             if token != self._manual_point_token:
                 return {}
+
+            # Evaluate Vin safety shutdown if PA snapshot is valid and numeric Vin is present
+            pa_vin = pa.values.get("vin") if pa and pa.valid else None
+            if pa_vin is not None and isinstance(pa_vin, (int, float)) and math.isfinite(float(pa_vin)):
+                is_safe, vin_fault_desc = check_vin_safety(
+                    float(pa_vin),
+                    float(settings["vin_target"]),
+                    settings.get("vin_safety_enabled", True),
+                )
+                if not is_safe:
+                    try:
+                        self.hub.instruments["load"].safe_off()
+                    except Exception:
+                        pass
+                    return {
+                        "vin_safety_tripped": True,
+                        "target_vin": float(settings["vin_target"]),
+                        "measured_vin": float(pa_vin),
+                        "fault_desc": vin_fault_desc,
+                    }
+
             store.create_run(run_rec)
             derived, warnings = calculate_measurement(pa, load, psu, settings["supply_channels"])
             record = {
@@ -5605,6 +5692,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return record
 
         def on_done(record: dict[str, Any]):
+            if record and record.get("vin_safety_tripped"):
+                self._manual_point_token += 1
+                self._manual_active_task = False
+                self.point_action_busy = False
+                self._cancel_manual_automation("ABORTED", quiet=True)
+                self.step_present_lbl.setText("0.00 A · OFF")
+                self.step_present_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-family: Consolas, monospace; font-size: 24px; font-weight: 900;")
+                self._manual_target_current = 0.0
+                self.manual_target_spin.setValue(0.0)
+                if hasattr(self, "plot_progress_marker"):
+                    self.plot_progress_marker.update_position(0.0, 0.0, self.manual_mode_max_current(), active=False)
+                self._update_manual_status("ABORTED · Vin Safety", "error")
+                self.statusBar().showMessage("Vin safety shutdown · LOAD OFF", 10000)
+                self._finalize_manual_session(f"Vin safety shutdown; {record['fault_desc'].replace(chr(10), '; ')}")
+                self.show_vin_safety_dialog(record["target_vin"], record["measured_vin"])
+                self.update_enabled_states()
+                return
+
             if token != self._manual_point_token:
                 if record:
                     self._run_function(lambda: store.discard_interrupted_point(pid, run_id, "Interrupted by operator current reduction / LOAD OFF"))
@@ -6069,6 +6174,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "run_id": run_id, "run_record": run_record, "points": points, "capture_points": capture_points,
             "mode": mode, "settle": settle, "dwell": dwell, "sample_window": s_win, "sample_count": s_cnt,
             "cooldown": cooldown, "working_cap": cap, "vin_target": self.vin_target.value(),
+            "vin_safety_enabled": self.chk_vin_safety.isChecked() if hasattr(self, "chk_vin_safety") else bool(self.config.get("vin_safety_enabled", True)),
             "modulation": base_campaign, "frequency": frequency_hz,
             "supply_channels": channels, "psu_required": psu_req,
             "data_source": data_source, "duplicate_action": "keep",
@@ -6153,6 +6259,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.measurement.connect(self._measurement_received)
         self.worker.warning.connect(lambda msg: self.statusBar().showMessage(msg))
         self.worker.completed.connect(self._run_completed)
+        self.worker.vin_safety_tripped.connect(self._on_vin_safety_tripped)
 
         self.plot_rows.clear()
         self.live_curve.setData([], [])
@@ -6197,6 +6304,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stop_sweep_btn.setEnabled(False)
             self.strip_stop_btn.setText("■ RETURNING TO ZERO...")
             self.strip_stop_btn.setEnabled(False)
+
+    def _on_vin_safety_tripped(self, target_vin: float, measured_vin: float):
+        self._state_changed("ABORTED", "Vin safety shutdown · LOAD OFF")
+        self.statusBar().showMessage("Vin safety shutdown · LOAD OFF", 10000)
+        self.show_vin_safety_dialog(target_vin, measured_vin)
+
+    def show_vin_safety_dialog(self, target_vin: float, measured_vin: float):
+        low = target_vin * 0.90
+        high = target_vin * 1.10
+        msg = (
+            "The electronic load was turned OFF because Vin moved outside\n"
+            "±10% of Target Vin.\n\n"
+            f"Target Vin: {target_vin:.1f} V\n"
+            f"Measured Vin: {measured_vin:.1f} V\n"
+            f"Allowed range: {low:.1f}–{high:.1f} V\n\n"
+            "Check the input supply current limit, source protection,\n"
+            "wiring, and converter condition before restarting."
+        )
+        QtWidgets.QMessageBox.critical(
+            self,
+            "INPUT VOLTAGE SAFETY SHUTDOWN",
+            msg,
+            QtWidgets.QMessageBox.StandardButton.Ok,
+        )
 
     def _ramp_progress_received(self, amps: float):
         if hasattr(self, "live_cmd_lbl"):

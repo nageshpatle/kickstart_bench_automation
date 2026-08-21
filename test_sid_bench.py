@@ -4016,3 +4016,254 @@ def test_plot_visual_smoothness_and_pen_styling():
     assert window.live_aux_curve.opts["symbolBrush"].color().name().lower() == PLOT_AUX_TEAL.lower()
 
     window.close()
+
+
+def test_check_vin_safety_helper():
+    """Verify check_vin_safety helper logic: ±10% window, boundary inclusivity, low/high faults, and disabled bypass."""
+    from sid_bench_gui import check_vin_safety
+
+    # 1. Nominal voltages inside ±10%
+    safe, msg = check_vin_safety(measured_vin=47.5, target_vin=48.0, enabled=True)
+    assert safe is True
+    assert msg == ""
+
+    # 2. Exact boundaries: 48 * 0.90 = 43.2 V, 48 * 1.10 = 52.8 V
+    safe, msg = check_vin_safety(measured_vin=43.2, target_vin=48.0, enabled=True)
+    assert safe is True
+    assert msg == ""
+
+    safe, msg = check_vin_safety(measured_vin=52.8, target_vin=48.0, enabled=True)
+    assert safe is True
+    assert msg == ""
+
+    # 3. Low Vin fault: 42.0 V (< 43.2 V)
+    safe, msg = check_vin_safety(measured_vin=42.0, target_vin=48.0, enabled=True)
+    assert safe is False
+    assert "Target Vin: 48.0 V" in msg
+    assert "Measured Vin: 42.0 V" in msg
+    assert "Allowed range: 43.2–52.8 V" in msg
+
+    # 4. Severe source collapse: 0.8 V
+    safe, msg = check_vin_safety(measured_vin=0.8, target_vin=48.0, enabled=True)
+    assert safe is False
+    assert "Measured Vin: 0.8 V" in msg
+
+    # 5. High Vin fault: 54.0 V (> 52.8 V)
+    safe, msg = check_vin_safety(measured_vin=54.0, target_vin=48.0, enabled=True)
+    assert safe is False
+    assert "Measured Vin: 54.0 V" in msg
+
+    # 6. Target Vin 60 V: range 54.0–66.0 V
+    safe, msg = check_vin_safety(measured_vin=55.0, target_vin=60.0, enabled=True)
+    assert safe is True
+    safe, msg = check_vin_safety(measured_vin=53.0, target_vin=60.0, enabled=True)
+    assert safe is False
+    assert "Allowed range: 54.0–66.0 V" in msg
+
+    # 7. Disabled protection returns safe
+    safe, msg = check_vin_safety(measured_vin=42.0, target_vin=48.0, enabled=False)
+    assert safe is True
+    assert msg == ""
+
+    # 8. Non-positive target or invalid measured Vin returns safe
+    safe, msg = check_vin_safety(measured_vin=42.0, target_vin=0.0, enabled=True)
+    assert safe is True
+    safe, msg = check_vin_safety(measured_vin=float("nan"), target_vin=48.0, enabled=True)
+    assert safe is True
+
+
+def test_vin_safety_checkbox_and_persistence(tmp_path: Path, monkeypatch):
+    """Verify LoadCard has chk_vin_safety checkbox, correct text/tooltip, and persists to bench_config.json."""
+    import os
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets
+    from sid_bench_gui import MainWindow, DEFAULT_CONFIG
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
+    assert "vin_safety_enabled" in DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["vin_safety_enabled"] is True
+
+    window = MainWindow()
+    assert hasattr(window, "chk_vin_safety")
+    assert hasattr(window.load_card, "chk_vin_safety")
+    assert window.chk_vin_safety is window.load_card.chk_vin_safety
+    assert "Auto LOAD OFF if Vin is outside ±10% of Target" in window.chk_vin_safety.text()
+    assert "90%" in window.chk_vin_safety.toolTip()
+    assert "110%" in window.chk_vin_safety.toolTip()
+    assert window.chk_vin_safety.isChecked() is True
+
+    # Test toggling updates config and settings
+    window.chk_vin_safety.setChecked(False)
+    assert window.config.get("vin_safety_enabled") is False
+    settings = window._collect_settings()
+    assert settings["vin_safety_enabled"] is False
+
+    window.chk_vin_safety.setChecked(True)
+    assert window.config.get("vin_safety_enabled") is True
+    settings = window._collect_settings()
+    assert settings["vin_safety_enabled"] is True
+
+    window.close()
+
+
+def test_vin_safety_sweep_worker_aborts_and_safe_off(tmp_path: Path):
+    """Verify SweepWorker immediately aborts on Vin fault, calls load.safe_off(), preserves prior valid points, and does not save fault point."""
+    from sid_bench_gui import SweepWorker, InstrumentHub, WorkbookStore
+    from sid_instruments import InstrumentSnapshot
+
+    class FakeLoad:
+        def __init__(self):
+            self.currents = []
+            self.safe_off_called = False
+            self.identity = "Chroma,63206A,123,1.0"
+        def connect(self, persistent=True): pass
+        def release(self): pass
+        def set_current(self, amps: float): self.currents.append(amps)
+        def set_input(self, state: bool): pass
+        def safe_off(self): self.safe_off_called = True
+        def read_snapshot(self, **_: Any):
+            return InstrumentSnapshot("load", {"current": self.currents[-1] if self.currents else 0.0, "enabled": True})
+
+    class FakePA:
+        def __init__(self):
+            self.call_count = 0
+            self.identity = "Keysight,PA2201A,123,1.0"
+        def connect(self, persistent=True): pass
+        def release(self): pass
+        def read_snapshot(self):
+            self.call_count += 1
+            # Point 1 (index 0): 48.0 V (normal)
+            # Point 2 (index 1): 42.0 V (Vin droop fault!)
+            vin = 48.0 if self.call_count == 1 else 42.0
+            return InstrumentSnapshot("pa", {"vin": vin, "vout": 12.0, "iin": 2.5, "pin": 120.0})
+
+    hub = InstrumentHub(True, {})
+    fake_load = FakeLoad()
+    fake_pa = FakePA()
+    hub.instruments["load"] = fake_load
+    hub.instruments["pa"] = fake_pa
+    hub.instruments["scope"] = None
+
+    store = WorkbookStore(tmp_path / "vin_safety_test.xlsx")
+
+    settings = {
+        "run_id": "TEST-VIN-SAFETY",
+        "run_record": {
+            "RunID": "TEST-VIN-SAFETY", "CampaignName": "Test_VinSafety", "Created": "2026-08-21T00:00:00Z",
+            "Status": "Aborted", "DataSource": "Hardware", "Mode": "Continuous", "VinTarget_V": 48.0,
+            "ModulationLabel": "", "Frequency_Hz": 80000.0, "ModulationMetadata": "",
+            "AuxA_Included": False, "AuxB_Included": False, "AuxC_Included": False,
+            "SupplyConfiguration": [], "WorkingCap_A": 60.0, "Notes": "", "InstrumentIdentities": {},
+            "FPGASnapshotStatus": "Unavailable", "FPGASnapshot": {}, "Warnings": "",
+        },
+        "points": [10.0, 20.0, 30.0],
+        "capture_points": set(),
+        "mode": "Continuous",
+        "settle": 0.01,
+        "dwell": 0.01,
+        "sample_window": 0.01,
+        "sample_count": 1,
+        "cooldown": 0.01,
+        "working_cap": 60.0,
+        "vin_target": 48.0,
+        "vin_safety_enabled": True,
+        "modulation": "",
+        "frequency": 80000.0,
+        "supply_channels": [],
+        "psu_required": False,
+        "data_source": "Hardware",
+        "duplicate_action": "keep",
+        "return_to_zero_step": 5.0,
+    }
+
+    tripped_events = []
+    completed_events = []
+
+    worker = SweepWorker(hub, store, settings)
+    worker.vin_safety_tripped.connect(lambda t_vin, m_vin: tripped_events.append((t_vin, m_vin)))
+    worker.completed.connect(lambda status, warnings: completed_events.append((status, warnings)))
+
+    worker.run()
+
+    # 1. Verify load.safe_off() was called immediately
+    assert fake_load.safe_off_called is True
+
+    # 2. Verify vin_safety_tripped signal fired with target 48V and measured 42V
+    assert len(tripped_events) == 1
+    assert tripped_events[0] == (48.0, 42.0)
+
+    # 3. Verify run completed with Status Aborted and safety warning
+    assert len(completed_events) == 1
+    status, warnings = completed_events[0]
+    assert status == "Aborted"
+    assert "Vin safety shutdown" in warnings
+    assert "48.0 V" in warnings
+    assert "42.0 V" in warnings
+    assert "43.2–52.8 V" in warnings
+
+    # 4. Verify the prior valid point (10 A) is preserved in workbook, and the 20 A fault point is NOT saved
+    meas = store.get_run_measurements("TEST-VIN-SAFETY")
+    assert len(meas) == 1
+    assert meas[0]["RequestedIout_A"] == 10.0
+    assert meas[0]["Status"] == "Valid"
+
+
+def test_vin_safety_manual_set_and_step_mode(monkeypatch):
+    """Verify Set Current and Step Current handle Vin safety fault: safe_off load, cancel timers, abort run, show dialog."""
+    import os, time
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PyQt6 import QtWidgets
+    from sid_bench_gui import MainWindow
+    from sid_instruments import InstrumentSnapshot
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([""])
+    window = MainWindow()
+    window.simulation.setChecked(True)
+    window.chk_load.setChecked(True)
+    window.chk_vin_safety.setChecked(True)
+    window.vin_target.setValue(48.0)
+
+    dialog_shown = []
+    monkeypatch.setattr(window, "show_vin_safety_dialog", lambda t, m: dialog_shown.append((t, m)))
+
+    # Mock PA snapshot with collapsing Vin (31.2 V)
+    monkeypatch.setattr(
+        window.hub.instruments["pa"],
+        "read_snapshot",
+        lambda: InstrumentSnapshot("pa", {"vin": 31.2, "vout": 12.0, "iin": 1.0, "pin": 31.2})
+    )
+
+    load_safe_off = []
+    monkeypatch.setattr(window.hub.instruments["load"], "safe_off", lambda: load_safe_off.append(True))
+
+    # Trigger manual Direct Set
+    window.btn_mode_direct.click()
+    window.manual_target_spin.setValue(10.0)
+    window.direct_auto_delay.setValue(1.0)
+    window.btn_direct_set.click()
+
+    # Wait for countdown timer to become active
+    def wait_for_ui(condition, timeout_sec=3.0):
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            QtWidgets.QApplication.processEvents()
+            if condition():
+                return
+            time.sleep(0.02)
+        assert condition()
+
+    wait_for_ui(lambda: window._manual_countdown_timer.isActive())
+    window._manual_remaining_ms = 0
+    window._manual_countdown_tick()
+
+    wait_for_ui(lambda: len(dialog_shown) > 0)
+
+    assert len(dialog_shown) == 1
+    assert dialog_shown[0] == (48.0, 31.2)
+    assert len(load_safe_off) > 0
+    assert "0.00 A · OFF" in window.step_present_lbl.text()
+    assert "ABORTED" in window.direct_status_lbl.text()
+    assert window._manual_countdown_timer.isActive() is False
+
+    window.close()
+
